@@ -39,6 +39,11 @@ migrate_working_dir/
 **/android/.cxx/
 **/android/.externalNativeBuild/
 **/android/captures/
+**/android/app/build/
+
+# Native C++ 3rd Party SDK Downloads (NCNN prebuilt binaries)
+**/android/app/src/main/cpp/ncnn/
+**/android/app/src/main/cpp/3rdparty/
 
 # iOS build & generated files
 **/ios/Flutter/Generated.xcconfig

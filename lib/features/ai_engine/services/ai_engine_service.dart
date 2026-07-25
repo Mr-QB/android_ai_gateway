@@ -13,6 +13,10 @@ class AIEngineService {
     return _bindings.getEngineVersion();
   }
 
+  bool hasVulkanGPU() {
+    return _bindings.hasNcnnVulkan();
+  }
+
   AIInferenceResultModel processFrame({
     required Uint8List bytes,
     required int width,
@@ -37,7 +41,7 @@ class AIEngineService {
         confidence: nativeResult.confidence,
       );
     } catch (e) {
-      debugPrint('AI Processing error: $e');
+      debugPrint('NCNN AI Processing error: $e');
       return AIInferenceResultModel.empty();
     } finally {
       calloc.free(ptr);

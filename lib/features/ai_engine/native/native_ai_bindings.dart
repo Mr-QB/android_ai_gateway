@@ -26,6 +26,9 @@ final class NativeAIInferenceResult extends ffi.Struct {
 typedef CGetVersion = ffi.Int32 Function();
 typedef DartGetVersion = int Function();
 
+typedef CGetNcnnVulkan = ffi.Int32 Function();
+typedef DartGetNcnnVulkan = int Function();
+
 typedef CProcessImageFrame = NativeAIInferenceResult Function(
   ffi.Pointer<ffi.Uint8> imageBytes,
   ffi.Int32 width,
@@ -43,6 +46,7 @@ typedef DartProcessImageFrame = NativeAIInferenceResult Function(
 class NativeAIBindings {
   late final ffi.DynamicLibrary _nativeLib;
   late final DartGetVersion _getVersion;
+  late final DartGetNcnnVulkan _getNcnnVulkan;
   late final DartProcessImageFrame _processImageFrame;
 
   bool _isLoaded = false;
@@ -66,6 +70,10 @@ class NativeAIBindings {
           .lookup<ffi.NativeFunction<CGetVersion>>('get_ai_engine_version')
           .asFunction();
 
+      _getNcnnVulkan = _nativeLib
+          .lookup<ffi.NativeFunction<CGetNcnnVulkan>>('get_ncnn_has_vulkan')
+          .asFunction();
+
       _processImageFrame = _nativeLib
           .lookup<ffi.NativeFunction<CProcessImageFrame>>('process_image_frame')
           .asFunction();
@@ -79,6 +87,11 @@ class NativeAIBindings {
   int getEngineVersion() {
     if (!_isLoaded) return -1;
     return _getVersion();
+  }
+
+  bool hasNcnnVulkan() {
+    if (!_isLoaded) return false;
+    return _getNcnnVulkan() == 1;
   }
 
   NativeAIInferenceResult processFrame(

@@ -5,6 +5,10 @@ project("native_ai_engine" LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Configure NCNN SDK Path for Android ABI
+set(ncnn_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ncnn/ncnn-20260526-android-vulkan/${ANDROID_ABI}/lib/cmake/ncnn)
+find_package(ncnn REQUIRED)
+
 add_library(
     native_ai_engine
     SHARED
@@ -18,5 +22,6 @@ find_library(
 
 target_link_libraries(
     native_ai_engine
+    ncnn
     ${log-lib}
 )

@@ -21,12 +21,14 @@ class _CameraScreenState extends State<CameraScreen> {
   int _selectedCameraIndex = 0;
   String? _errorMessage;
   int _engineVersion = -1;
+  bool _hasVulkan = false;
   AIInferenceResultModel? lastResult;
 
   @override
   void initState() {
     super.initState();
     _engineVersion = _aiEngineService.getVersion();
+    _hasVulkan = _aiEngineService.hasVulkanGPU();
     if (widget.cameras.isNotEmpty) {
       _initCamera(_selectedCameraIndex);
     } else {
@@ -89,7 +91,7 @@ class _CameraScreenState extends State<CameraScreen> {
           children: [
             Icon(Icons.memory, color: Color(0xFF7F5AF0)),
             SizedBox(width: 8),
-            Text('Android AI Gateway'),
+            Text('Android AI Gateway (NCNN)'),
           ],
         ),
         actions: [
@@ -126,7 +128,7 @@ class _CameraScreenState extends State<CameraScreen> {
           children: [
             CircularProgressIndicator(),
             SizedBox(height: 16),
-            Text('Đang kết nối Camera & AI Engine...'),
+            Text('Đang kết nối Camera & NCNN Engine...'),
           ],
         ),
       );
@@ -147,7 +149,7 @@ class _CameraScreenState extends State<CameraScreen> {
                   ),
                 ),
               ),
-              // AI Native Status Overlay Banner
+              // NCNN Status Overlay Banner
               Positioned(
                 top: 24,
                 left: 24,
@@ -163,27 +165,40 @@ class _CameraScreenState extends State<CameraScreen> {
                       width: 1.5,
                     ),
                   ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(
-                        _aiEngineService.isNativeLoaded
-                            ? Icons.check_circle
-                            : Icons.warning,
-                        size: 16,
-                        color: _aiEngineService.isNativeLoaded
-                            ? const Color(0xFF2CB67D)
-                            : const Color(0xFFFF5470),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            _aiEngineService.isNativeLoaded
+                                ? Icons.check_circle
+                                : Icons.warning,
+                            size: 16,
+                            color: _aiEngineService.isNativeLoaded
+                                ? const Color(0xFF2CB67D)
+                                : const Color(0xFFFF5470),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            _aiEngineService.isNativeLoaded
+                                ? 'NCNN Core v$_engineVersion (Loaded)'
+                                : 'NCNN Engine (Not Loaded)',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(width: 6),
+                      const SizedBox(height: 4),
                       Text(
-                        _aiEngineService.isNativeLoaded
-                            ? 'C++ Engine v$_engineVersion (Loaded)'
-                            : 'C++ Engine (Not Loaded)',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
+                        _hasVulkan ? '⚡ Vulkan GPU Acceleration: Enabled' : '💻 Compute Mode: CPU Only',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _hasVulkan ? Colors.amberAccent : Colors.white70,
                         ),
                       ),
                     ],
@@ -212,7 +227,6 @@ class _CameraScreenState extends State<CameraScreen> {
               ElevatedButton.icon(
                 onPressed: _aiEngineService.isNativeLoaded
                     ? () {
-                        // Demo trigger C++ process frame
                         final dummyBytes = Uint8List(640 * 480 * 3);
                         final result = _aiEngineService.processFrame(
                           bytes: dummyBytes,
@@ -226,15 +240,15 @@ class _CameraScreenState extends State<CameraScreen> {
                         ScaffoldMessenger.of(context).showSnackBar(
                           SnackBar(
                             content: Text(
-                              'C++ Inference: ${result.inferenceTimeMs.toStringAsFixed(2)}ms | Conf: ${(result.confidence * 100).toStringAsFixed(0)}%',
+                              'NCNN Mat Processed (${result.width}x${result.height}) | Latency: ${result.inferenceTimeMs.toStringAsFixed(2)}ms',
                             ),
                             duration: const Duration(seconds: 2),
                           ),
                         );
                       }
                     : null,
-                icon: const Icon(Icons.bolt),
-                label: const Text('Test C++ AI'),
+                icon: const Icon(Icons.flash_on),
+                label: const Text('Test NCNN'),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF7F5AF0),
                   foregroundColor: Colors.white,
