@@ -1,5 +1,5 @@
-#ifndef NANODET_ENGINE_H
-#define NANODET_ENGINE_H
+#ifndef YOLO26_ENGINE_H
+#define YOLO26_ENGINE_H
 
 #include <cstdint>
 #include <mutex>
@@ -7,7 +7,7 @@
 
 #include "net.h"
 
-struct NanoDetObject {
+struct Yolo26Object {
     int32_t class_id = -1;
     float confidence = 0.0f;
     float x = 0.0f;
@@ -16,13 +16,13 @@ struct NanoDetObject {
     float height = 0.0f;
 };
 
-class NanoDetEngine {
+class Yolo26Engine {
 public:
-    NanoDetEngine() = default;
-    ~NanoDetEngine();
+    Yolo26Engine() = default;
+    ~Yolo26Engine();
 
-    NanoDetEngine(const NanoDetEngine&) = delete;
-    NanoDetEngine& operator=(const NanoDetEngine&) = delete;
+    Yolo26Engine(const Yolo26Engine&) = delete;
+    Yolo26Engine& operator=(const Yolo26Engine&) = delete;
 
     int load(
         const char* param_path,
@@ -34,7 +34,7 @@ public:
         const uint8_t* rgb_bytes,
         int width,
         int height,
-        std::vector<NanoDetObject>& objects,
+        std::vector<Yolo26Object>& objects,
         float probability_threshold,
         float nms_threshold,
         float* inference_time_ms
@@ -53,13 +53,13 @@ private:
     bool loaded_ = false;
     bool using_gpu_ = false;
 
-    int target_size_ = 320;
-    float mean_values_[3] = {127.0f, 127.0f, 127.0f};
-    float norm_values_[3] = {
-        1.0f / 128.0f,
-        1.0f / 128.0f,
-        1.0f / 128.0f,
+    const int target_size_ = 640;
+    const float mean_values_[3] = {0.0f, 0.0f, 0.0f};
+    const float norm_values_[3] = {
+        1.0f / 255.0f,
+        1.0f / 255.0f,
+        1.0f / 255.0f,
     };
 };
 
-#endif // NANODET_ENGINE_H
+#endif // YOLO26_ENGINE_H

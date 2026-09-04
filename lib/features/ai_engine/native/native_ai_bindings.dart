@@ -47,27 +47,37 @@ typedef DartGetVersion = int Function();
 typedef CGetNcnnVulkan = ffi.Int32 Function();
 typedef DartGetNcnnVulkan = int Function();
 
-typedef CLoadNanoDetModel =
+typedef CLoadYolo26Model =
     ffi.Int32 Function(
       ffi.Pointer<ffi.Char> paramPath,
       ffi.Pointer<ffi.Char> binPath,
       ffi.Int32 useGpu,
     );
-typedef DartLoadNanoDetModel =
+typedef DartLoadYolo26Model =
     int Function(
       ffi.Pointer<ffi.Char> paramPath,
       ffi.Pointer<ffi.Char> binPath,
       int useGpu,
     );
 
-typedef CIsNanoDetModelLoaded = ffi.Int32 Function();
-typedef DartIsNanoDetModelLoaded = int Function();
+typedef CIsYolo26ModelLoaded = ffi.Int32 Function();
+typedef DartIsYolo26ModelLoaded = int Function();
 
-typedef CGetNanoDetBackend = ffi.Int32 Function();
-typedef DartGetNanoDetBackend = int Function();
+typedef CGetYolo26Backend = ffi.Int32 Function();
+typedef DartGetYolo26Backend = int Function();
 
-typedef CUnloadNanoDetModel = ffi.Void Function();
-typedef DartUnloadNanoDetModel = void Function();
+typedef CUnloadYolo26Model = ffi.Void Function();
+typedef DartUnloadYolo26Model = void Function();
+
+// Aliases for legacy NanoDet bindings
+typedef CLoadNanoDetModel = CLoadYolo26Model;
+typedef DartLoadNanoDetModel = DartLoadYolo26Model;
+typedef CIsNanoDetModelLoaded = CIsYolo26ModelLoaded;
+typedef DartIsNanoDetModelLoaded = DartIsYolo26ModelLoaded;
+typedef CGetNanoDetBackend = CGetYolo26Backend;
+typedef DartGetNanoDetBackend = DartGetYolo26Backend;
+typedef CUnloadNanoDetModel = CUnloadYolo26Model;
+typedef DartUnloadNanoDetModel = DartUnloadYolo26Model;
 
 typedef CDetectRgbImage =
     ffi.Int32 Function(
@@ -112,10 +122,10 @@ class NativeAIBindings {
 
   late final DartGetVersion _getVersion;
   late final DartGetNcnnVulkan _getNcnnVulkan;
-  late final DartLoadNanoDetModel _loadNanoDetModel;
-  late final DartIsNanoDetModelLoaded _isNanoDetModelLoaded;
-  late final DartGetNanoDetBackend _getNanoDetBackend;
-  late final DartUnloadNanoDetModel _unloadNanoDetModel;
+  late final DartLoadYolo26Model _loadYolo26Model;
+  late final DartIsYolo26ModelLoaded _isYolo26ModelLoaded;
+  late final DartGetYolo26Backend _getYolo26Backend;
+  late final DartUnloadYolo26Model _unloadYolo26Model;
   late final DartDetectRgbImage _detectRgbImage;
   late final DartProcessImageFrame _processImageFrame;
 
@@ -141,22 +151,44 @@ class NativeAIBindings {
       _getNcnnVulkan = _nativeLib
           .lookup<ffi.NativeFunction<CGetNcnnVulkan>>('get_ncnn_has_vulkan')
           .asFunction();
-      _loadNanoDetModel = _nativeLib
-          .lookup<ffi.NativeFunction<CLoadNanoDetModel>>('load_nanodet_model')
-          .asFunction();
-      _isNanoDetModelLoaded = _nativeLib
-          .lookup<ffi.NativeFunction<CIsNanoDetModelLoaded>>(
-            'is_nanodet_model_loaded',
-          )
-          .asFunction();
-      _getNanoDetBackend = _nativeLib
-          .lookup<ffi.NativeFunction<CGetNanoDetBackend>>('get_nanodet_backend')
-          .asFunction();
-      _unloadNanoDetModel = _nativeLib
-          .lookup<ffi.NativeFunction<CUnloadNanoDetModel>>(
-            'unload_nanodet_model',
-          )
-          .asFunction();
+
+      // Look up YOLO26 symbols, or fallback to legacy symbols
+      try {
+        _loadYolo26Model = _nativeLib
+            .lookup<ffi.NativeFunction<CLoadYolo26Model>>('load_yolo26_model')
+            .asFunction();
+        _isYolo26ModelLoaded = _nativeLib
+            .lookup<ffi.NativeFunction<CIsYolo26ModelLoaded>>(
+              'is_yolo26_model_loaded',
+            )
+            .asFunction();
+        _getYolo26Backend = _nativeLib
+            .lookup<ffi.NativeFunction<CGetYolo26Backend>>('get_yolo26_backend')
+            .asFunction();
+        _unloadYolo26Model = _nativeLib
+            .lookup<ffi.NativeFunction<CUnloadYolo26Model>>(
+              'unload_yolo26_model',
+            )
+            .asFunction();
+      } catch (_) {
+        _loadYolo26Model = _nativeLib
+            .lookup<ffi.NativeFunction<CLoadNanoDetModel>>('load_nanodet_model')
+            .asFunction();
+        _isYolo26ModelLoaded = _nativeLib
+            .lookup<ffi.NativeFunction<CIsNanoDetModelLoaded>>(
+              'is_nanodet_model_loaded',
+            )
+            .asFunction();
+        _getYolo26Backend = _nativeLib
+            .lookup<ffi.NativeFunction<CGetNanoDetBackend>>('get_nanodet_backend')
+            .asFunction();
+        _unloadYolo26Model = _nativeLib
+            .lookup<ffi.NativeFunction<CUnloadNanoDetModel>>(
+              'unload_nanodet_model',
+            )
+            .asFunction();
+      }
+
       _detectRgbImage = _nativeLib
           .lookup<ffi.NativeFunction<CDetectRgbImage>>('detect_rgb_image')
           .asFunction();
@@ -180,29 +212,42 @@ class NativeAIBindings {
     return _getNcnnVulkan() == 1;
   }
 
-  int loadNanoDetModel(
+  int loadYolo26Model(
     ffi.Pointer<ffi.Char> paramPath,
     ffi.Pointer<ffi.Char> binPath,
     bool useGpu,
   ) {
     if (!_isLoaded) return -100;
-    return _loadNanoDetModel(paramPath, binPath, useGpu ? 1 : 0);
+    return _loadYolo26Model(paramPath, binPath, useGpu ? 1 : 0);
   }
 
-  bool isNanoDetModelLoaded() {
+  bool isYolo26ModelLoaded() {
     if (!_isLoaded) return false;
-    return _isNanoDetModelLoaded() == 1;
+    return _isYolo26ModelLoaded() == 1;
   }
 
-  int getNanoDetBackend() {
+  int getYolo26Backend() {
     if (!_isLoaded) return -1;
-    return _getNanoDetBackend();
+    return _getYolo26Backend();
   }
 
-  void unloadNanoDetModel() {
+  void unloadYolo26Model() {
     if (!_isLoaded) return;
-    _unloadNanoDetModel();
+    _unloadYolo26Model();
   }
+
+  // Legacy NanoDet aliases for backward compatibility
+  int loadNanoDetModel(
+    ffi.Pointer<ffi.Char> paramPath,
+    ffi.Pointer<ffi.Char> binPath,
+    bool useGpu,
+  ) => loadYolo26Model(paramPath, binPath, useGpu);
+
+  bool isNanoDetModelLoaded() => isYolo26ModelLoaded();
+
+  int getNanoDetBackend() => getYolo26Backend();
+
+  void unloadNanoDetModel() => unloadYolo26Model();
 
   int detectRgbImage({
     required ffi.Pointer<ffi.Uint8> rgbBytes,

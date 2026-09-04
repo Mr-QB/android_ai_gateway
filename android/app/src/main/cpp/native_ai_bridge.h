@@ -41,15 +41,25 @@ AI_EXPORT int32_t get_ncnn_has_vulkan(void);
 // -1 = đường dẫn không hợp lệ
 // -2 = lỗi file .param
 // -3 = lỗi file .bin
-AI_EXPORT int32_t load_nanodet_model(
+AI_EXPORT int32_t load_yolo26_model(
     const char* param_path,
     const char* bin_path,
     int32_t use_gpu
 );
 
-AI_EXPORT int32_t is_nanodet_model_loaded(void);
+AI_EXPORT int32_t is_yolo26_model_loaded(void);
 
 // -1 = chưa load, 0 = CPU, 1 = Vulkan GPU
+AI_EXPORT int32_t get_yolo26_backend(void);
+AI_EXPORT void unload_yolo26_model(void);
+
+// Compatibility aliases for legacy bindings
+AI_EXPORT int32_t load_nanodet_model(
+    const char* param_path,
+    const char* bin_path,
+    int32_t use_gpu
+);
+AI_EXPORT int32_t is_nanodet_model_loaded(void);
 AI_EXPORT int32_t get_nanodet_backend(void);
 AI_EXPORT void unload_nanodet_model(void);
 

@@ -6,20 +6,20 @@
 #include <vector>
 
 #include "gpu.h"
-#include "nanodet_engine.h"
 #include "net.h"
+#include "yolo26_engine.h"
 
 #define LOG_TAG "NativeAIEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 namespace {
-NanoDetEngine g_nanodet_engine;
+Yolo26Engine g_yolo26_engine;
 }
 
 extern "C" {
 
 AI_EXPORT int32_t get_ai_engine_version(void) {
-    return 120; // 1.2.0: multi-object detection
+    return 130; // 1.3.0: YOLO26n 640x640 detection
 }
 
 AI_EXPORT int32_t get_ncnn_has_vulkan(void) {
@@ -30,27 +30,48 @@ AI_EXPORT int32_t get_ncnn_has_vulkan(void) {
 #endif
 }
 
+AI_EXPORT int32_t load_yolo26_model(
+    const char* param_path,
+    const char* bin_path,
+    int32_t use_gpu
+) {
+    return g_yolo26_engine.load(param_path, bin_path, use_gpu == 1);
+}
+
+AI_EXPORT int32_t is_yolo26_model_loaded(void) {
+    return g_yolo26_engine.is_loaded() ? 1 : 0;
+}
+
+AI_EXPORT int32_t get_yolo26_backend(void) {
+    if (!g_yolo26_engine.is_loaded()) {
+        return -1;
+    }
+    return g_yolo26_engine.is_using_gpu() ? 1 : 0;
+}
+
+AI_EXPORT void unload_yolo26_model(void) {
+    g_yolo26_engine.unload();
+}
+
+// Backward-compatible aliases for legacy callers
 AI_EXPORT int32_t load_nanodet_model(
     const char* param_path,
     const char* bin_path,
     int32_t use_gpu
 ) {
-    return g_nanodet_engine.load(param_path, bin_path, use_gpu == 1);
+    return load_yolo26_model(param_path, bin_path, use_gpu);
 }
 
 AI_EXPORT int32_t is_nanodet_model_loaded(void) {
-    return g_nanodet_engine.is_loaded() ? 1 : 0;
+    return is_yolo26_model_loaded();
 }
 
 AI_EXPORT int32_t get_nanodet_backend(void) {
-    if (!g_nanodet_engine.is_loaded()) {
-        return -1;
-    }
-    return g_nanodet_engine.is_using_gpu() ? 1 : 0;
+    return get_yolo26_backend();
 }
 
 AI_EXPORT void unload_nanodet_model(void) {
-    g_nanodet_engine.unload();
+    unload_yolo26_model();
 }
 
 AI_EXPORT int32_t detect_rgb_image(
@@ -67,8 +88,8 @@ AI_EXPORT int32_t detect_rgb_image(
         return -4;
     }
 
-    std::vector<NanoDetObject> objects;
-    const int result = g_nanodet_engine.detect(
+    std::vector<Yolo26Object> objects;
+    const int result = g_yolo26_engine.detect(
         rgb_bytes,
         width,
         height,

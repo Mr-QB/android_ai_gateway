@@ -16,9 +16,9 @@ class AIEngineService {
   int _lastModelLoadCode = -999;
 
   bool get isNativeLoaded => _bindings.isLoaded;
-  bool get isModelLoaded => _bindings.isNanoDetModelLoaded();
+  bool get isModelLoaded => _bindings.isYolo26ModelLoaded();
   int get lastModelLoadCode => _lastModelLoadCode;
-  int get modelBackend => _bindings.getNanoDetBackend();
+  int get modelBackend => _bindings.getYolo26Backend();
 
   String get modelBackendName {
     return switch (modelBackend) {
@@ -41,21 +41,21 @@ class AIEngineService {
     ffi.Pointer<Utf8>? binPathPointer;
 
     try {
-      final modelFiles = await _modelAssetService.prepareNanoDetModel();
+      final modelFiles = await _modelAssetService.prepareYolo26Model();
       paramPathPointer = modelFiles.paramPath.toNativeUtf8();
       binPathPointer = modelFiles.binPath.toNativeUtf8();
 
-      _lastModelLoadCode = _bindings.loadNanoDetModel(
+      _lastModelLoadCode = _bindings.loadYolo26Model(
         paramPathPointer.cast<ffi.Char>(),
         binPathPointer.cast<ffi.Char>(),
         preferGpu,
       );
 
-      debugPrint('NanoDet load result: $_lastModelLoadCode');
-      return _lastModelLoadCode == 0 && _bindings.isNanoDetModelLoaded();
+      debugPrint('YOLO26 load result: $_lastModelLoadCode');
+      return _lastModelLoadCode == 0 && _bindings.isYolo26ModelLoaded();
     } catch (error, stackTrace) {
       _lastModelLoadCode = -101;
-      debugPrint('NanoDet initialization error: $error');
+      debugPrint('YOLO26 initialization error: $error');
       debugPrintStack(stackTrace: stackTrace);
       return false;
     } finally {
@@ -75,8 +75,8 @@ class AIEngineService {
     if (!_bindings.isLoaded) {
       throw StateError('Native AI library is not loaded');
     }
-    if (!_bindings.isNanoDetModelLoaded()) {
-      throw StateError('NanoDet model is not loaded');
+    if (!_bindings.isYolo26ModelLoaded()) {
+      throw StateError('YOLO26 model is not loaded');
     }
     if (rgbBytes.length != width * height * 3) {
       throw ArgumentError(
@@ -103,7 +103,7 @@ class AIEngineService {
       );
 
       if (count < 0) {
-        throw StateError('NanoDet inference failed with code $count');
+        throw StateError('YOLO26 inference failed with code $count');
       }
 
       final detections = List<Detection>.generate(count, (index) {
@@ -130,6 +130,6 @@ class AIEngineService {
   }
 
   void unloadModel() {
-    _bindings.unloadNanoDetModel();
+    _bindings.unloadYolo26Model();
   }
 }

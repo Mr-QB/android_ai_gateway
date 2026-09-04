@@ -92,5 +92,6 @@ flutter:
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
   assets:
-    - assets/models/nanodet-ELite0_320.param
-    - assets/models/nanodet-ELite0_320.bin
+    - assets/models/yolo26n.param
+    - assets/models/yolo26n.bin
+    - assets/images/sample_test.jpg

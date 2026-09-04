@@ -2,6 +2,7 @@ import 'dart:typed_data' as typed;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 
 import '../../ai_engine/domain/detection.dart';
@@ -122,8 +123,8 @@ class _CameraScreenState extends State<CameraScreen> {
     });
 
     final message = loaded
-        ? 'NanoDet đã load bằng ${_aiEngineService.modelBackendName}'
-        : 'Không load được NanoDet. Mã lỗi: ${_aiEngineService.lastModelLoadCode}';
+        ? 'YOLO26n (640x640) đã load bằng ${_aiEngineService.modelBackendName}'
+        : 'Không load được YOLO26n. Mã lỗi: ${_aiEngineService.lastModelLoadCode}';
     _showMessage(message);
   }
 
@@ -134,7 +135,7 @@ class _CameraScreenState extends State<CameraScreen> {
     }
 
     if (!_aiEngineService.isModelLoaded) {
-      _showMessage('Hãy nhấn “Load NanoDet” trước.');
+      _showMessage('Hãy nhấn “Load YOLO26n” trước.');
       return;
     }
 
@@ -192,6 +193,78 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  Future<void> _detectSampleImage() async {
+    if (_isDetecting) return;
+
+    if (!_aiEngineService.isModelLoaded) {
+      _showMessage('Đang tự động nạp YOLO26n...');
+      final loaded = await _aiEngineService.initializeModel(preferGpu: false);
+      if (!mounted) return;
+      setState(() {
+        _isModelLoaded = loaded;
+      });
+      if (!loaded) {
+        _showMessage('Không nạp được model YOLO26n.');
+        return;
+      }
+    }
+
+    setState(() {
+      _isDetecting = true;
+    });
+
+    try {
+      final byteData = await rootBundle.load('assets/images/sample_test.jpg');
+      final jpegBytes = byteData.buffer.asUint8List();
+      final decoded = img.decodeImage(jpegBytes);
+      if (decoded == null) {
+        throw StateError('Không giải mã được ảnh mẫu.');
+      }
+
+      final oriented = img.bakeOrientation(decoded);
+      final rgbBytes = oriented.getBytes(order: img.ChannelOrder.rgb);
+      final batch = _aiEngineService.detectRgb(
+        rgbBytes: rgbBytes,
+        width: oriented.width,
+        height: oriented.height,
+        probabilityThreshold: 0.35,
+        nmsThreshold: 0.50,
+      );
+
+      final displayBytes = typed.Uint8List.fromList(
+        img.encodeJpg(oriented, quality: 90),
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _result = _CapturedDetectionResult(
+          imageBytes: displayBytes,
+          imageWidth: oriented.width,
+          imageHeight: oriented.height,
+          detections: batch.detections,
+          inferenceTimeMs: batch.inferenceTimeMs,
+        );
+      });
+
+      _showMessage(
+        'Ảnh mẫu: Tìm thấy ${batch.detections.length} vật thể trong '
+        '${batch.inferenceTimeMs.toStringAsFixed(1)} ms',
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Sample detection failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted) {
+        _showMessage('Nhận diện ảnh mẫu thất bại: $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isDetecting = false;
+        });
+      }
+    }
+  }
+
   void _showMessage(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -217,10 +290,15 @@ class _CameraScreenState extends State<CameraScreen> {
           children: [
             Icon(Icons.memory, color: Color(0xFF7F5AF0)),
             SizedBox(width: 8),
-            Text('EdgeAI NanoDet'),
+            Text('EdgeAI YOLO26n (640x640)'),
           ],
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.image_search),
+            onPressed: _isDetecting ? null : _detectSampleImage,
+            tooltip: 'Thử nhận diện ảnh mẫu',
+          ),
           if (widget.cameras.length > 1)
             IconButton(
               icon: const Icon(Icons.switch_camera),
@@ -378,8 +456,8 @@ class _CameraScreenState extends State<CameraScreen> {
               _isModelLoading
                   ? 'Đang load...'
                   : _isModelLoaded
-                  ? 'NanoDet Loaded'
-                  : 'Load NanoDet',
+                  ? 'YOLO26n Loaded'
+                  : 'Load YOLO26n',
             ),
           ),
           ElevatedButton.icon(

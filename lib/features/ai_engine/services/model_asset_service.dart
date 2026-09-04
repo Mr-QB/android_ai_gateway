@@ -3,23 +3,26 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
-class NanoDetModelFiles {
+class Yolo26ModelFiles {
   final String paramPath;
   final String binPath;
 
-  const NanoDetModelFiles({required this.paramPath, required this.binPath});
+  const Yolo26ModelFiles({required this.paramPath, required this.binPath});
 }
+
+// Backward compatibility alias
+typedef NanoDetModelFiles = Yolo26ModelFiles;
 
 /// Chuẩn bị model NCNN thành các file thật trên bộ nhớ riêng của ứng dụng.
 ///
 /// Flutter assets nằm bên trong APK nên C++ không thể dùng trực tiếp như một
 /// đường dẫn thông thường. Service này copy model sang Application Support.
 class ModelAssetService {
-  static const String _paramAsset = 'assets/models/nanodet-ELite0_320.param';
+  static const String _paramAsset = 'assets/models/yolo26n.param';
 
-  static const String _binAsset = 'assets/models/nanodet-ELite0_320.bin';
+  static const String _binAsset = 'assets/models/yolo26n.bin';
 
-  Future<NanoDetModelFiles> prepareNanoDetModel() async {
+  Future<Yolo26ModelFiles> prepareYolo26Model() async {
     final Directory supportDirectory = await getApplicationSupportDirectory();
 
     final Directory modelDirectory = Directory(
@@ -28,18 +31,19 @@ class ModelAssetService {
 
     await modelDirectory.create(recursive: true);
 
-    final File paramFile = File(
-      '${modelDirectory.path}/nanodet-ELite0_320.param',
-    );
+    final File paramFile = File('${modelDirectory.path}/yolo26n.param');
 
-    final File binFile = File('${modelDirectory.path}/nanodet-ELite0_320.bin');
+    final File binFile = File('${modelDirectory.path}/yolo26n.bin');
 
     await _copyAssetIfNeeded(assetPath: _paramAsset, destination: paramFile);
 
     await _copyAssetIfNeeded(assetPath: _binAsset, destination: binFile);
 
-    return NanoDetModelFiles(paramPath: paramFile.path, binPath: binFile.path);
+    return Yolo26ModelFiles(paramPath: paramFile.path, binPath: binFile.path);
   }
+
+  // Alias for backward compatibility
+  Future<Yolo26ModelFiles> prepareNanoDetModel() => prepareYolo26Model();
 
   Future<void> _copyAssetIfNeeded({
     required String assetPath,
