@@ -16,7 +16,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.android_ai_gateway"
-        minSdk = flutter.minSdkVersion
+        minSdk = 26
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -44,3 +44,17 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+configurations.all {
+    resolutionStrategy {
+        force("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+        force("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    }
+}
+
+dependencies {
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.16.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+}
+

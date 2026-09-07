@@ -60,3 +60,18 @@ migrate_working_dir/
 # Debug / Symbol / Obfuscation outputs
 app.*.symbols
 app.*.map.json
+
+# Temporary screenshots & debugging captures
+*.png
+!assets/**/*.png
+screen*.png
+.temp_*
+
+# Temporary decompile / analysis artifacts
+temp_classes/
+temp_classes*
+
+# Downloaded models & cache
+models_download/
+*.litertlm
+

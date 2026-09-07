@@ -38,6 +38,9 @@ dependencies:
   ffi: ^2.2.0
   path_provider: ^2.1.6
   image: ^4.9.1
+  image_picker: ^1.1.2
+  google_mlkit_text_recognition: ^0.17.1
+  flutter_tts: ^4.2.5
 
 dev_dependencies:
   flutter_test:

@@ -290,7 +290,12 @@ class _CameraScreenState extends State<CameraScreen> {
           children: [
             Icon(Icons.memory, color: Color(0xFF7F5AF0)),
             SizedBox(width: 8),
-            Text('EdgeAI YOLO26n (640x640)'),
+            Flexible(
+              child: Text(
+                'YOLO26n (640x640)',
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
           ],
         ),
         actions: [

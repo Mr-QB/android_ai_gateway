@@ -1,64 +1,109 @@
-# Android AI Gateway (Edge AI with YOLO26n)
+# Android AI Gateway (Edge AI with YOLO26n & Dual VLM Benchmark)
 
-Ứng dụng Flutter kết hợp C++ Native Engine (NCNN) để chạy nhận diện vật thể thời gian thực (**Real-time Object Detection**) hoàn toàn on-device trên Android.
+Ứng dụng Flutter kết hợp C++ Native Engine (NCNN) và Google LiteRT-LM để chạy nhận diện đối tượng thời gian thực (**YOLO26n**) và so sánh hiệu năng 2 mô hình thị giác - ngôn ngữ on-device (**SmolVLM2-500M vs Gemma-4-E2B-it**).
 
 ---
 
 ## 🚀 Tính năng nổi bật
 
-* **Mô hình**: **YOLO26n** (Phiên bản Nano mới nhất từ Ultralytics, phát hành đầu năm 2026).
-* **Độ phân giải đầu vào**: **`640x640`** (RGB) giúp phát hiện chi tiết và chính xác các vật thể kích thước vừa và nhỏ.
-* **Kiến trúc NMS-Free & DFL-Free**: Loại bỏ các bước giải mã anchor phân phối phức tạp và Non-Maximum Suppression nặng nề trên CPU, tăng tốc độ xử lý hơn 40% so với các thế hệ cũ.
-* **Framework suy luận**: **Tencent NCNN** hỗ trợ tăng tốc phần cứng thông qua **ARM NEON** (đa luồng CPU) và **Vulkan GPU Compute** (Adreno / Mali).
-* **Kiến trúc Native C++ Bridge**: Sử dụng Dart FFI giao tiếp trực tiếp với thư viện C++ native `libnative_ai_engine.so` mà không qua MethodChannel, đảm bảo độ trễ (latency) tối thiểu khi nhận diện luồng camera.
-* **Dataset**: Nhận diện 80 lớp chuẩn COCO (người, phương tiện, động vật, đồ gia dụng...).
+### 1. Real-Time Object Detection: YOLO26n (640x640)
+* **Mô hình**: **YOLO26n** (Phiên bản Nano từ Ultralytics, phát hành đầu năm 2026).
+* **Độ phân giải đầu vào**: **`640x640`** (RGB) giúp phát hiện chi tiết các vật thể kích thước vừa và nhỏ.
+* **Kiến trúc NMS-Free & DFL-Free**: Tối ưu tốc độ xử lý hơn 40% so với các thế hệ cũ.
+* **Framework suy luận**: **Tencent NCNN** hỗ trợ tăng tốc **ARM NEON** và **Vulkan GPU Compute** (Adreno / Mali).
+* **Kiến trúc Native C++ Bridge**: Sử dụng Dart FFI giao tiếp trực tiếp với `libnative_ai_engine.so`.
+* 📖 **Tài liệu chi tiết cơ chế gọi & phân tích FPS**: Xem [docs/YOLO_PIPELINE_AND_PERFORMANCE.md](docs/YOLO_PIPELINE_AND_PERFORMANCE.md).
+
 
 ---
 
-## 📁 Cấu trúc thư mục AI Native & Models
+## 🧠 Benchmark 2 Mô hình On-Device VLM (Google LiteRT-LM v0.16.1)
 
+Ứng dụng tích hợp tab **VLM Benchmark** (ngoài cùng bên phải thanh điều hướng) hỗ trợ benchmark so sánh trực tiếp 2 mô hình VLM chạy hoàn toàn on-device:
+
+| Tiêu chí | SmolVLM2-500M | Gemma-4-E2B-it |
+| :--- | :--- | :--- |
+| **Repo HuggingFace** | `litert-community/SmolVLM2-500M` | `litert-community/gemma-4-E2B-it-litert-lm` |
+| **File Bundle** | `SmolVLM2-500M.litertlm` | `gemma-4-E2B-it-gpu.litertlm` (GPU) / `gemma-4-E2B-it.litertlm` (CPU) |
+| **Dung lượng file** | ~344 MB | ~2.01 GB |
+| **Kiến trúc tham số** | 500M Parameters | 5.1B Total, 2.3B Active Params (Per-Layer Embeddings) |
+| **Context Length** | 512 visual/text tokens | Lên tới 128K context |
+| **Tăng tốc phần cứng** | GPU (OpenCL/Mali-G610) / CPU | GPU (OpenCL/Mali-G610) / CPU |
+
+---
+
+### ⚙️ Kiến trúc Tối ưu Bắt buộc (Engine Persistence & Model Switching)
+
+1. **Persistent Warm Engine Holder (Singleton)**:
+   - Model chỉ nạp vào RAM/VRAM **đúng 1 lần duy nhất** (Cold Start).
+   - Từ lần chạy thứ 2 trở đi (**Warm Inference**), trọng số mô hình, OpenCL GPU shaders, tokenizer và bộ nhớ đệm được **tái sử dụng 100%**, thời gian **Model Load = 0 ms**.
+   - Mỗi câu hỏi/ảnh mới chỉ khởi tạo `Conversation(ConversationConfig())` siêu nhẹ (< 5 ms) trên warm engine có sẵn, giúp dọn sạch KV-cache của ảnh trước và tránh tràn giới hạn context token (`Task failed with state: 7`).
+
+2. **Cơ chế Chuyển đổi Model An toàn (Xiaomi 12T - RAM 8GB)**:
+   - Để tránh quá tải bộ nhớ khi nạp đồng thời cả 2 model, app chỉ giữ **1 model resident** tại một thời điểm.
+   - Khi chuyển từ `SmolVLM2` $\rightarrow$ `Gemma-4` (hoặc ngược lại):
+     ```
+     Đóng Conversation cũ -> Hủy Engine cũ -> Gọi System.gc() -> Nạp Model mới -> Giữ Resident
+     ```
+
+3. **Đo đạc chính xác TTFT (Time To First Token) & Tokens/s**:
+   - Sử dụng Kotlin coroutine streaming qua `Conversation.sendMessageAsync(contents)` trả về `Flow<Message>`.
+   - Ghi nhận chính xác mốc thời gian chunk token đầu tiên phát ra (**TTFT**).
+   - Đo đạc tốc độ giải mã thực tế (`tokensPerSecond`).
+
+4. **Tự động hóa Benchmark x5 (Cold Start vs Warm Runs)**:
+   - Nút **[BENCH x5]** tự động chạy 5 lượt suy luận liên tiếp trên cùng 1 ảnh và câu hỏi.
+   - Bảng thống kê chi tiết cho từng vòng: `TTFT`, `Generation Time`, `Total Time`, `Tokens/s`, `RAM Native/Java`.
+   - Tính toán trung bình hiệu năng các lượt Warm Inference và hỗ trợ nút **Copy JSON Report**.
+
+5. **Tối ưu hóa ảnh đầu vào**:
+   - Ảnh chụp từ Camera hoặc Gallery được tiền xử lý tự động (resize về `~512x512` bảo toàn tỷ lệ khung hình, nắn chiều xoay EXIF) trước khi chuyển vào mô hình, ngăn ngừa OOM từ ảnh camera 108MP/12MP.
+
+---
+
+## 📥 Hướng dẫn Tải & Nạp Model vào Xiaomi 12T bằng ADB
+
+Thư mục lưu trữ nội bộ của app:
 ```text
-android_ai_gateway/
-├── assets/
-│   └── models/
-│       ├── yolo26n.param      # Cấu trúc đồ thị mạng YOLO26n (NCNN)
-│       ├── yolo26n.bin        # Trọng số mô hình FP16 (~4.9 MB)
-│       └── README.md          # Ghi chú chi tiết & lệnh export model
-├── android/app/src/main/cpp/
-│   ├── CMakeLists.txt         # Cấu hình build C++ native & tự động tải NCNN SDK
-│   ├── native_ai_bridge.h     # Interface C Export cho Dart FFI
-│   ├── native_ai_bridge.cpp   # Implementation bridge
-│   ├── yolo26_engine.h        # Khai báo Engine suy luận YOLO26
-│   └── yolo26_engine.cpp      # Preprocessing (letterbox 640x640), NCNN extractor & postprocessing
-└── lib/features/ai_engine/
-    ├── native/
-    │   └── native_ai_bindings.dart  # Dart FFI bindings
-    └── services/
-        ├── model_asset_service.dart # Copy model từ APK sang Application Support
-        └── ai_engine_service.dart   # Quản lý lifecycle & gọi detect
+/data/user/0/com.example.android_ai_gateway/files/models/
+    SmolVLM2-500M.litertlm
+    gemma-4-E2B-it-gpu.litertlm
 ```
 
----
-
-## 🛠 Hướng dẫn xuất (Export) mô hình YOLO26n 640x640
-
-Mô hình hiện tại trong thư mục `assets/models/` được tạo tự động qua Python script:
-
+### 1. Nạp SmolVLM2-500M (344 MB)
 ```bash
-pip install -U ultralytics
-python -c "from ultralytics import YOLO; model = YOLO('yolo26n.pt'); model.export(format='ncnn', imgsz=640, half=True)"
+# Tải file từ HuggingFace:
+curl -L -o SmolVLM2-500M.litertlm "https://huggingface.co/litert-community/SmolVLM2-500M/resolve/main/SmolVLM2-500M.litertlm"
+
+# Đẩy vào thiết bị qua ADB:
+adb push SmolVLM2-500M.litertlm /data/local/tmp/
+adb shell run-as com.example.android_ai_gateway cp /data/local/tmp/SmolVLM2-500M.litertlm files/models/
 ```
 
-Sau đó copy 2 file `model.ncnn.param` và `model.ncnn.bin` vào `assets/models/` với tên:
-* `assets/models/yolo26n.param`
-* `assets/models/yolo26n.bin`
+### 2. Nạp Gemma-4-E2B-it-gpu (2.01 GB)
+```bash
+# Tải file bundle tối ưu GPU từ HuggingFace:
+curl -L -o gemma-4-E2B-it-gpu.litertlm "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it-gpu.litertlm"
+
+# Đẩy vào thiết bị qua ADB:
+adb push gemma-4-E2B-it-gpu.litertlm /data/local/tmp/
+adb shell run-as com.example.android_ai_gateway cp /data/local/tmp/gemma-4-E2B-it-gpu.litertlm files/models/
+```
 
 ---
 
-## 📱 Hiệu năng tham khảo trên Android
+## 📊 Kết quả Benchmark Tham khảo (Xiaomi 12T - MediaTek Dimensity 8100-Ultra / GPU Mali-G610 MC6)
 
-* **GPU Vulkan**: Tận dụng GPU Adreno (Qualcomm) hoặc Mali (MediaTek) với độ trễ tối ưu.
-* **CPU ARM NEON**: Tự động nhận diện số lõi lớn (`get_big_cpu_count()`) để chạy đa luồng tối đa hiệu năng.
-* **Tốc độ xử lý (640x640)**:
-  * Flagship / Cận cao cấp (Snapdragon 8 Gen, 7+ Gen): ~15–25 ms/frame (~40–60 FPS).
-  * Tầm trung (Dimensity 7000/8000 series, Snapdragon 7 series): ~25–40 ms/frame (~25–40 FPS).
+### SmolVLM2-500M (OpenCL GPU Delegate)
+* **Cold Start Load**: ~6,800 ms (biên dịch OpenCL kernels vào Mali-G610 VRAM).
+* **Warm Model Load**: **0 ms** (Engine resident).
+* **TTFT (Time To First Token)**: ~350 - 550 ms.
+* **Tốc độ sinh (Decode Speed)**: ~14 - 18 tokens/giây.
+* **Bộ nhớ RAM sử dụng**: Native Heap ~800 MB, Java Heap ~18 MB.
+
+### Gemma-4-E2B-it (GPU Bundle)
+* **Cold Start Load**: ~12,000 - 16,000 ms.
+* **Warm Model Load**: **0 ms** (Engine resident).
+* **TTFT**: ~1,200 - 1,800 ms.
+* **Tốc độ sinh (Decode Speed)**: ~6 - 9 tokens/giây.
+* **Bộ nhớ RAM sử dụng**: Native Heap ~3.2 GB, Java Heap ~24 MB.
