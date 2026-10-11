@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -17,7 +18,14 @@ import '../../perception/agents/smol/hazard_agent.dart';
 import '../../perception/agents/smol/relation_agent.dart';
 import '../../perception/agents/gemma/text_agent.dart';
 import '../../perception/agents/gemma/reasoning_agent.dart';
+import '../../assistant/intent_router.dart';
+import '../../assistant/device_command_service.dart';
+import '../../assistant/reminder_parser.dart';
+import '../../assistant/reminder_service.dart';
+import '../../assistant/vietnamese_text.dart';
+import '../../assistant/vietnamese_asr_service.dart';
 import '../models/vlm_result.dart';
+import '../models/vlm_stream_event.dart';
 import '../services/vlm_service.dart';
 import 'sense_graph_viewer_page.dart';
 
@@ -39,6 +47,9 @@ class _VlmTestPageState extends State<VlmTestPage> {
   final OcrService _ocrService = OcrService();
   final SenseGraphManager _graphManager = SenseGraphManager();
   final ImagePicker _imagePicker = ImagePicker();
+  final ReminderService _reminderService = NativeReminderService();
+  final DeviceCommandService _deviceCommandService = DeviceCommandService();
+  final VietnameseAsrService _asrService = VietnameseAsrService();
 
   // Selected Image
   String? _selectedImagePath;
@@ -49,11 +60,15 @@ class _VlmTestPageState extends State<VlmTestPage> {
   bool _isAgentRunning = false;
   String? _agentRuleOutput;
   String? _agentVlmOutput;
+  String? _agentRawResponse;
   String? _lastAgentName;
   String? _lastEngineUsed;
   Map<String, double> _agentLatencies = {};
+  double _intentRouterLatencyMs = 0;
   List<OcrResultItem> _lastOcrItems = [];
   bool _ttsEnabled = true;
+  bool _isListening = false;
+  StreamSubscription<VietnameseAsrEvent>? _asrSubscription;
 
   // --- Single VLM Benchmark State ---
   final TextEditingController _promptController = TextEditingController();
@@ -63,6 +78,7 @@ class _VlmTestPageState extends State<VlmTestPage> {
 
   VlmStatus _status = VlmStatus.empty();
   VlmResult? _lastResult;
+  String _streamingText = '';
   VlmBenchmarkReport? _lastBenchmarkReport;
 
   bool _isCheckingStatus = false;
@@ -91,6 +107,15 @@ class _VlmTestPageState extends State<VlmTestPage> {
 
   @override
   void dispose() {
+    if (_isInferring) unawaited(_vlmService.cancel());
+    if (_isAgentRunning) {
+      unawaited(_vlmService.cancel());
+      unawaited(_outputManager.stop());
+    }
+    if (_isListening) {
+      unawaited(_asrSubscription?.cancel());
+      unawaited(_asrService.stop());
+    }
     _promptController.dispose();
     _agentQueryController.dispose();
     super.dispose();
@@ -130,15 +155,16 @@ class _VlmTestPageState extends State<VlmTestPage> {
           _lastBenchmarkReport = null;
           _agentRuleOutput = null;
           _agentVlmOutput = null;
+          _agentRawResponse = null;
           _lastOcrItems = [];
         });
       }
     } catch (e) {
       debugPrint('[VLM] Error picking image: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Lỗi chọn ảnh: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Lỗi chọn ảnh: $e')));
       }
     }
   }
@@ -157,15 +183,16 @@ class _VlmTestPageState extends State<VlmTestPage> {
           _lastBenchmarkReport = null;
           _agentRuleOutput = null;
           _agentVlmOutput = null;
+          _agentRawResponse = null;
           _lastOcrItems = [];
         });
       }
     } catch (e) {
       debugPrint('[VLM] Error loading sample image: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Lỗi tải ảnh mẫu: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Lỗi tải ảnh mẫu: $e')));
       }
     }
   }
@@ -173,7 +200,186 @@ class _VlmTestPageState extends State<VlmTestPage> {
   // -------------------------------------------------------------
   // MULTI-AGENT PERCEPTION WORKFLOWS
   // -------------------------------------------------------------
-  Future<void> _executeAgentTask(AgentTask task) async {
+  Future<void> _routeAndExecuteQuery() async {
+    final query = _agentQueryController.text.trim();
+    final stopwatch = Stopwatch()..start();
+    final result = IntentRouter.route(query);
+    stopwatch.stop();
+    _intentRouterLatencyMs = stopwatch.elapsedMicroseconds / 1000;
+    debugPrint(
+      '[INTENT] intent=${result.type.wireName} '
+      'confidence=${result.confidence} '
+      'slotKeys=${result.slots.keys.join(',')}',
+    );
+
+    switch (result.type) {
+      case IntentType.visionQuery:
+      case IntentType.sceneDescription:
+        await _executeAgentTask(AgentTask.describeScene, userQuery: query);
+      case IntentType.safetyAlert:
+        await _executeAgentTask(AgentTask.detectHazard);
+      case IntentType.ocrQuery:
+        await _executeAgentTask(AgentTask.readText);
+      case IntentType.reminderCreate:
+        final message = result.slots['message']?.toString() ?? '';
+        final delay = int.tryParse(
+          result.slots['delay_minutes']?.toString() ?? '',
+        );
+        if (message.isEmpty || delay == null) {
+          _showIntentFeedback(result, 'Câu nhắc chưa đủ thông tin.');
+          return;
+        }
+        try {
+          final reminder = await _reminderService.create(
+            ReminderRequest(message: message, delayMinutes: delay),
+          );
+          final notificationNote = reminder.notificationsEnabled
+              ? ''
+              : ' Hãy cấp quyền thông báo để nhận nhắc trên màn hình.';
+          _showIntentFeedback(
+            result,
+            'Đã đặt nhắc “${reminder.message}” sau $delay phút.'
+            '$notificationNote',
+          );
+        } catch (error) {
+          _showIntentFeedback(result, 'Không đặt được lời nhắc: $error');
+        }
+      case IntentType.reminderCancel:
+        try {
+          final reminders = await _reminderService.list();
+          final target = result.slots['target']?.toString();
+          final normalizedTarget = target
+              ?.replaceFirst(RegExp(r'^(viec )'), '')
+              .trim();
+          final matches = reminders.where((reminder) {
+            return normalizedTarget == null ||
+                normalizedTarget.isEmpty ||
+                VietnameseText.normalize(
+                  reminder.message,
+                ).contains(normalizedTarget);
+          }).toList();
+          if (matches.length == 1) {
+            await _reminderService.cancel(matches.single.id);
+            _showIntentFeedback(
+              result,
+              'Đã hủy nhắc “${matches.single.message}”.',
+            );
+          } else if (matches.isEmpty) {
+            _showIntentFeedback(result, 'Không tìm thấy lời nhắc phù hợp.');
+          } else {
+            _showIntentFeedback(
+              result,
+              'Có ${matches.length} lời nhắc phù hợp. Hãy nêu rõ nội dung cần hủy.',
+            );
+          }
+        } catch (error) {
+          _showIntentFeedback(result, 'Không hủy được lời nhắc: $error');
+        }
+      case IntentType.reminderList:
+        try {
+          final reminders = await _reminderService.list();
+          final details = reminders.isEmpty
+              ? 'Bạn chưa có lời nhắc nào đang chờ.'
+              : reminders
+                    .map((reminder) {
+                      final localTime = reminder.scheduledAt.toLocal();
+                      return '• ${reminder.message} — '
+                          '${localTime.hour.toString().padLeft(2, '0')}:'
+                          '${localTime.minute.toString().padLeft(2, '0')}';
+                    })
+                    .join('\n');
+          _showIntentFeedback(result, details);
+        } catch (error) {
+          _showIntentFeedback(result, 'Không tải được danh sách nhắc: $error');
+        }
+      case IntentType.deviceCommand:
+        final action = result.slots['action']?.toString();
+        const supported = {
+          'volume_up',
+          'volume_down',
+          'flashlight_on',
+          'flashlight_off',
+        };
+        if (!supported.contains(action)) {
+          _showIntentFeedback(
+            result,
+            'Đã nhận diện lệnh thiết bị nhưng lệnh này chưa được hỗ trợ.',
+          );
+          return;
+        }
+        try {
+          await _deviceCommandService.execute(action!);
+          final details = switch (action) {
+            'volume_up' => 'Đã tăng âm lượng.',
+            'volume_down' => 'Đã giảm âm lượng.',
+            'flashlight_on' => 'Đã bật đèn pin.',
+            _ => 'Đã tắt đèn pin.',
+          };
+          _showIntentFeedback(result, details);
+        } catch (error) {
+          debugPrint('[DEVICE_COMMAND] failed action=$action error=$error');
+          _showIntentFeedback(result, 'Không thực hiện được lệnh thiết bị.');
+        }
+      case IntentType.unknown:
+        _showIntentFeedback(
+          result,
+          'Chưa phân loại được câu hỏi; không gọi VLM.',
+        );
+    }
+  }
+
+  Future<void> _cancelAgentTask() async {
+    await _vlmService.cancel();
+    await _outputManager.interrupt();
+  }
+
+  Future<void> _toggleVoiceQuery() async {
+    if (_isListening) {
+      await _asrService.stop();
+      await _asrSubscription?.cancel();
+      if (mounted) setState(() => _isListening = false);
+      return;
+    }
+
+    setState(() => _isListening = true);
+    _asrSubscription = _asrService.listen().listen(
+      (event) {
+        if (event.type != 'partial' && event.type != 'final') return;
+        _agentQueryController.value = TextEditingValue(
+          text: event.text,
+          selection: TextSelection.collapsed(offset: event.text.length),
+        );
+        if (event.type == 'final' && mounted) {
+          setState(() => _isListening = false);
+          unawaited(_routeAndExecuteQuery());
+        }
+      },
+      onError: (Object error) {
+        if (!mounted) return;
+        setState(() => _isListening = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Nhận dạng giọng nói thất bại: $error')),
+        );
+      },
+      onDone: () {
+        if (mounted && _isListening) setState(() => _isListening = false);
+      },
+    );
+  }
+
+  void _showIntentFeedback(IntentResult result, String details) {
+    if (!mounted) return;
+    setState(() {
+      _lastAgentName = 'IntentRouter';
+      _lastEngineUsed = 'Deterministic rules';
+      _agentRuleOutput = null;
+      _agentVlmOutput = '${result.type.wireName}\n$details';
+      _agentRawResponse = null;
+      _agentLatencies = {'Intent Router': _intentRouterLatencyMs};
+    });
+  }
+
+  Future<void> _executeAgentTask(AgentTask task, {String? userQuery}) async {
     final imagePath = _selectedImagePath;
     if (imagePath == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -187,6 +393,7 @@ class _VlmTestPageState extends State<VlmTestPage> {
       _isAgentRunning = true;
       _agentRuleOutput = null;
       _agentVlmOutput = null;
+      _agentRawResponse = null;
       _agentLatencies = {};
     });
 
@@ -195,7 +402,11 @@ class _VlmTestPageState extends State<VlmTestPage> {
     try {
       switch (task) {
         case AgentTask.describeScene:
-          await _runSceneAgent(imagePath, overallStopwatch);
+          await _runSceneAgent(
+            imagePath,
+            overallStopwatch,
+            userQuery: userQuery,
+          );
           break;
 
         case AgentTask.detectHazard:
@@ -223,6 +434,9 @@ class _VlmTestPageState extends State<VlmTestPage> {
           await _runReasoningAgent(imagePath, overallStopwatch);
           break;
       }
+    } on VlmInferenceCancelled {
+      debugPrint('[MultiAgent] Task cancelled by user');
+      if (mounted) setState(() => _agentVlmOutput = 'Task cancelled.');
     } catch (e, st) {
       debugPrint('[MultiAgent] Task error: $e\n$st');
       if (mounted) {
@@ -235,17 +449,23 @@ class _VlmTestPageState extends State<VlmTestPage> {
         setState(() {
           _isAgentRunning = false;
         });
+        await _checkStatus();
       }
     }
   }
 
-  Future<void> _runSceneAgent(String imagePath, Stopwatch stopwatch) async {
+  Future<void> _runSceneAgent(
+    String imagePath,
+    Stopwatch stopwatch, {
+    String? userQuery,
+  }) async {
     _lastAgentName = 'SceneAgent';
     _lastEngineUsed = 'SmolVLM2-500M (FAST)';
 
     final agent = SceneAgent(engineManager: _engineManager);
     final result = await agent.execute(
       imagePath: imagePath,
+      userQuery: userQuery,
       ocrTexts: _lastOcrItems.map((o) => o.text).toList(),
     );
 
@@ -253,26 +473,21 @@ class _VlmTestPageState extends State<VlmTestPage> {
 
     if (mounted) {
       setState(() {
-        _agentVlmOutput = '''
+        _agentVlmOutput =
+            '''
 Loại không gian: ${result.sceneType}
 Tóm tắt: ${result.summary}
 Đối tượng chú ý: ${result.importantObjects.join(', ')}
 Độ tin cậy: ${(result.confidence * 100).toStringAsFixed(0)}%
-        '''.trim();
+        '''
+                .trim();
+        _agentRawResponse = result.rawResponse;
 
         _agentLatencies = {
           'Total Latency': stopwatch.elapsedMilliseconds.toDouble(),
           'VLM Inference': result.latencyMs,
         };
       });
-
-      if (_ttsEnabled && result.summary.isNotEmpty) {
-        _outputManager.dispatch(
-          message: result.summary,
-          priority: AlertPriority.normalDescription,
-          sourceAgent: 'SceneAgent',
-        );
-      }
     }
   }
 
@@ -288,7 +503,8 @@ Tóm tắt: ${result.summary}
 
     if (ruleSafety.hasImmediateHazard) {
       setState(() {
-        _agentRuleOutput = '🚨 CẢNH BÁO TỨC THÌ: ${ruleSafety.warningMessage} (${ruleSafety.direction})';
+        _agentRuleOutput =
+            '🚨 CẢNH BÁO TỨC THÌ: ${ruleSafety.warningMessage} (${ruleSafety.direction})';
       });
       if (_ttsEnabled) {
         _outputManager.dispatch(
@@ -299,7 +515,8 @@ Tóm tắt: ${result.summary}
       }
     } else {
       setState(() {
-        _agentRuleOutput = '✅ Kiểm tra quy tắc an toàn: Không phát hiện vật cản va chạm ngay trước mắt (< 5ms).';
+        _agentRuleOutput =
+            '✅ Kiểm tra quy tắc an toàn: Không phát hiện vật cản va chạm ngay trước mắt (< 5ms).';
       });
     }
 
@@ -311,13 +528,15 @@ Tóm tắt: ${result.summary}
 
     if (mounted) {
       setState(() {
-        _agentVlmOutput = '''
+        _agentVlmOutput =
+            '''
 Phát hiện nguy hiểm: ${result.hazard ? "CÓ NGUY HIỂM ⚠️" : "AN TOÀN ✅"}
 Mức độ nghiêm trọng: ${(result.severity * 100).toStringAsFixed(0)}%
 Hướng: ${result.direction}
 Lý do: ${result.reason}
 Thông báo: ${result.message}
-        '''.trim();
+        '''
+                .trim();
 
         _agentLatencies = {
           'Rule Pre-check': ruleWatch.elapsedMilliseconds.toDouble(),
@@ -348,7 +567,9 @@ Thông báo: ${result.message}
       final view = await _graphManager.createView(sceneType: 'image_test');
       _graphManager.ingestOcrTexts(
         view.id,
-        ocrItems.map((e) => (text: e.text, bbox: e.bbox, confidence: e.confidence)).toList(),
+        ocrItems
+            .map((e) => (text: e.text, bbox: e.bbox, confidence: e.confidence))
+            .toList(),
       );
     }
 
@@ -358,9 +579,13 @@ Thông báo: ${result.message}
         if (ocrItems.isEmpty) {
           _agentVlmOutput = 'Không tìm thấy ký tự văn bản rõ ràng trong ảnh.';
         } else {
-          final buffer = StringBuffer('Tìm thấy ${ocrItems.length} khối chữ:\n');
+          final buffer = StringBuffer(
+            'Tìm thấy ${ocrItems.length} khối chữ:\n',
+          );
           for (int i = 0; i < ocrItems.length; i++) {
-            buffer.writeln('${i + 1}. "${ocrItems[i].text}" (Tin cậy: ${(ocrItems[i].confidence * 100).toStringAsFixed(0)}%)');
+            buffer.writeln(
+              '${i + 1}. "${ocrItems[i].text}" (Tin cậy: ${(ocrItems[i].confidence * 100).toStringAsFixed(0)}%)',
+            );
           }
           _agentVlmOutput = buffer.toString().trim();
         }
@@ -372,7 +597,8 @@ Thông báo: ${result.message}
       });
 
       if (_ttsEnabled && ocrItems.isNotEmpty) {
-        final readSummary = 'Đọc được: ${ocrItems.take(3).map((e) => e.text).join(", ")}';
+        final readSummary =
+            'Đọc được: ${ocrItems.take(3).map((e) => e.text).join(", ")}';
         _outputManager.dispatch(
           message: readSummary,
           priority: AlertPriority.normalDescription,
@@ -382,7 +608,10 @@ Thông báo: ${result.message}
     }
   }
 
-  Future<void> _runExplainTextAgent(String imagePath, Stopwatch stopwatch) async {
+  Future<void> _runExplainTextAgent(
+    String imagePath,
+    Stopwatch stopwatch,
+  ) async {
     _lastAgentName = 'TextAgent';
     _lastEngineUsed = 'Gemma-4-E2B (DEEP)';
 
@@ -420,13 +649,15 @@ Thông báo: ${result.message}
 
     if (mounted) {
       setState(() {
-        _agentVlmOutput = '''
+        _agentVlmOutput =
+            '''
 Chữ gốc: "${topOcr.text}"
 Chữ chuẩn hóa (sửa lỗi OCR): "${result.normalizedText}"
 Loại ngữ nghĩa: ${result.semanticType}
 Mức độ quan trọng: ${result.importance}
 Giải thích: ${result.summary}
-        '''.trim();
+        '''
+                .trim();
 
         _agentLatencies = {
           'Gemma Reasoning': result.latencyMs,
@@ -453,21 +684,20 @@ Giải thích: ${result.summary}
         : _agentQueryController.text.trim();
 
     final agent = ReasoningAgent(engineManager: _engineManager);
-    final result = await agent.execute(
-      imagePath: imagePath,
-      userQuery: query,
-    );
+    final result = await agent.execute(imagePath: imagePath, userQuery: query);
 
     stopwatch.stop();
 
     if (mounted) {
       setState(() {
-        _agentVlmOutput = '''
+        _agentVlmOutput =
+            '''
 Câu hỏi: "$query"
 Trả lời: ${result.answer}
 Độ tin cậy: ${(result.confidence * 100).toStringAsFixed(0)}%
 Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None" : result.referencedNodes.join(", ")}
-        '''.trim();
+        '''
+                .trim();
 
         _agentLatencies = {
           'Graph Retrieval + Gemma': result.latencyMs,
@@ -499,9 +729,13 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
         if (result.relations.isEmpty) {
           _agentVlmOutput = 'Không trích xuất được quan hệ không gian mới.';
         } else {
-          final buffer = StringBuffer('Đã cập nhật ${result.relations.length} quan hệ vào SenseGraph:\n');
+          final buffer = StringBuffer(
+            'Đã cập nhật ${result.relations.length} quan hệ vào SenseGraph:\n',
+          );
           for (final rel in result.relations) {
-            buffer.writeln('• ${rel.subject}  ──[ ${rel.relation} ]──>  ${rel.object}');
+            buffer.writeln(
+              '• ${rel.subject}  ──[ ${rel.relation} ]──>  ${rel.object}',
+            );
           }
           _agentVlmOutput = buffer.toString().trim();
         }
@@ -535,7 +769,8 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
       setState(() {
         _isLoadingModel = false;
         if (res['success'] != true) {
-          _errorMessage = res['message']?.toString() ?? 'Không thể tải model VLM';
+          _errorMessage =
+              res['message']?.toString() ?? 'Không thể tải model VLM';
         }
       });
 
@@ -593,21 +828,45 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
     setState(() {
       _isInferring = true;
       _errorMessage = null;
+      _streamingText = '';
     });
 
     final modelInfo = VlmModelInfo.fromKey(_selectedModelKey);
-    final result = await _vlmService.analyzeImage(
-      imagePath: imagePath,
-      prompt: _promptController.text.trim(),
-      maxTokens: _selectedMaxTokens,
-      targetResolution: modelInfo.recommendedInputResolution,
-    );
+    VlmResult? result;
+    var cancelled = false;
+    try {
+      await for (final event in _vlmService.generateStream(
+        VlmRequest(
+          imagePath: imagePath,
+          prompt: _promptController.text.trim(),
+          maxTokens: _selectedMaxTokens,
+          targetResolution: modelInfo.recommendedInputResolution,
+        ),
+      )) {
+        if (!mounted) return;
+        switch (event) {
+          case VlmToken(:final text):
+            setState(() => _streamingText += text);
+          case VlmStreamCompleted(result: final completed):
+            result = completed;
+          case VlmStreamCancelled():
+            cancelled = true;
+          case VlmStreamFailed(:final error, :final message):
+            result = VlmResult.failure(error: error, message: message);
+        }
+      }
+    } catch (e) {
+      result = VlmResult.failure(
+        error: 'STREAM_EXCEPTION',
+        message: e.toString(),
+      );
+    }
 
     if (mounted) {
       setState(() {
-        _lastResult = result;
+        _lastResult = cancelled ? null : result;
         _isInferring = false;
-        if (!result.success) {
+        if (result != null && !result.success) {
           _errorMessage = result.message ?? result.error ?? 'Inference failed';
         }
       });
@@ -618,7 +877,9 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
     final imagePath = _selectedImagePath;
     if (imagePath == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Vui lòng chọn ảnh trước khi chạy benchmark x5.')),
+        const SnackBar(
+          content: Text('Vui lòng chọn ảnh trước khi chạy benchmark x5.'),
+        ),
       );
       return;
     }
@@ -646,7 +907,8 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
         _isBenchmarking = false;
         _lastBenchmarkReport = report;
         if (report == null) {
-          _errorMessage = 'Benchmark x5 thất bại. Vui lòng kiểm tra model và log.';
+          _errorMessage =
+              'Benchmark x5 thất bại. Vui lòng kiểm tra model và log.';
         }
       });
 
@@ -667,7 +929,10 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
             Expanded(
               child: Text(
                 'Benchmark x5: ${report.modelDisplayName}',
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
           ],
@@ -679,58 +944,78 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
             children: [
               Text('Backend thực tế: ${report.backend}'),
               if (report.coldLoadMs > 0)
-                Text('Cold Start Model Load: ${report.coldLoadMs.toStringAsFixed(0)} ms'),
+                Text(
+                  'Cold Start Model Load: ${report.coldLoadMs.toStringAsFixed(0)} ms',
+                ),
               const Divider(),
-              const Text('Kết quả 5 vòng chạy:', style: TextStyle(fontWeight: FontWeight.bold)),
+              const Text(
+                'Kết quả 5 vòng chạy:',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
               const SizedBox(height: 6),
-              ...report.runs.map((run) => Container(
-                    margin: const EdgeInsets.only(bottom: 6),
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF16161A),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: const Color(0xFF2E2E38)),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Text(
-                              'Vòng ${run.runIndex} (${run.isWarm ? "Warm" : "Cold Start"})',
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: run.isWarm ? Colors.greenAccent : Colors.orangeAccent,
-                              ),
+              ...report.runs.map(
+                (run) => Container(
+                  margin: const EdgeInsets.only(bottom: 6),
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF16161A),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF2E2E38)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            'Vòng ${run.runIndex} (${run.isWarm ? "Warm" : "Cold Start"})',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: run.isWarm
+                                  ? Colors.greenAccent
+                                  : Colors.orangeAccent,
                             ),
-                            Text(
-                              '${run.totalMs.toStringAsFixed(0)} ms',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                          ],
+                          ),
+                          Text(
+                            '${run.totalMs.toStringAsFixed(0)} ms',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'TTFT: ${run.ttftMs != null ? "${run.ttftMs!.toStringAsFixed(1)} ms" : "N/A"} | '
+                        'Gen: ${run.generationMs.toStringAsFixed(1)} ms | '
+                        'Tốc độ: ${run.tokensPerSecond.toStringAsFixed(1)} tok/s',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey.shade300,
                         ),
-                        const SizedBox(height: 4),
-                        Text(
-                          'TTFT: ${run.ttftMs != null ? "${run.ttftMs!.toStringAsFixed(1)} ms" : "N/A"} | '
-                          'Gen: ${run.generationMs.toStringAsFixed(1)} ms | '
-                          'Tốc độ: ${run.tokensPerSecond.toStringAsFixed(1)} tok/s',
-                          style: TextStyle(fontSize: 11, color: Colors.grey.shade300),
+                      ),
+                      Text(
+                        'RAM (Native/Java): ${run.nativeHeapMb.toStringAsFixed(1)} / ${run.javaHeapMb.toStringAsFixed(1)} MB | '
+                        'Tokens: ${run.tokenCount}',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.grey.shade400,
                         ),
-                        Text(
-                          'RAM (Native/Java): ${run.nativeHeapMb.toStringAsFixed(1)} / ${run.javaHeapMb.toStringAsFixed(1)} MB | '
-                          'Tokens: ${run.tokenCount}',
-                          style: TextStyle(fontSize: 10, color: Colors.grey.shade400),
-                        ),
-                      ],
-                    ),
-                  )),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
               const Divider(),
-              const Text('Chỉ số trung bình (Warm Inferences):', style: TextStyle(fontWeight: FontWeight.bold)),
+              const Text(
+                'Chỉ số trung bình (Warm Inferences):',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
               const SizedBox(height: 4),
               Text('Avg TTFT: ${report.avgWarmTtftMs.toStringAsFixed(1)} ms'),
               Text('Avg Total: ${report.avgWarmTotalMs.toStringAsFixed(1)} ms'),
-              Text('Avg Tốc độ: ${report.avgWarmTokensPerSecond.toStringAsFixed(2)} tokens/s'),
+              Text(
+                'Avg Tốc độ: ${report.avgWarmTokensPerSecond.toStringAsFixed(2)} tokens/s',
+              ),
             ],
           ),
         ),
@@ -739,7 +1024,9 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
             icon: const Icon(Icons.copy, size: 16),
             label: const Text('Copy JSON'),
             onPressed: () {
-              Clipboard.setData(ClipboardData(text: jsonEncode(report.toJson())));
+              Clipboard.setData(
+                ClipboardData(text: jsonEncode(report.toJson())),
+              );
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(content: Text('Đã copy dữ liệu benchmark JSON')),
               );
@@ -766,14 +1053,21 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
           children: [
             Icon(Icons.hub_outlined, color: Color(0xFF7F5AF0)),
             SizedBox(width: 8),
-            Text('VLM & Perception Lab', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(
+              'VLM & Perception Lab',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
           ],
         ),
         actions: [
           IconButton(
-            icon: Icon(_ttsEnabled ? Icons.volume_up : Icons.volume_off,
-                color: _ttsEnabled ? Colors.greenAccent : Colors.grey),
-            tooltip: _ttsEnabled ? 'Tắt âm thanh trợ năng' : 'Bật âm thanh trợ năng',
+            icon: Icon(
+              _ttsEnabled ? Icons.volume_up : Icons.volume_off,
+              color: _ttsEnabled ? Colors.greenAccent : Colors.grey,
+            ),
+            tooltip: _ttsEnabled
+                ? 'Tắt âm thanh trợ năng'
+                : 'Bật âm thanh trợ năng',
             onPressed: () {
               setState(() {
                 _ttsEnabled = !_ttsEnabled;
@@ -782,12 +1076,20 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
           ),
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: (_isInferring || _isBenchmarking || _isAgentRunning) ? null : _checkStatus,
+            onPressed: (_isInferring || _isBenchmarking || _isAgentRunning)
+                ? null
+                : _checkStatus,
             tooltip: 'Kiểm tra trạng thái',
           ),
           IconButton(
             icon: const Icon(Icons.cleaning_services),
-            onPressed: (_isInferring || _isBenchmarking || _isAgentRunning || !_status.isLoaded) ? null : _unloadModel,
+            onPressed:
+                (_isInferring ||
+                    _isBenchmarking ||
+                    _isAgentRunning ||
+                    !_status.isLoaded)
+                ? null
+                : _unloadModel,
             tooltip: 'Giải phóng model khỏi RAM',
           ),
         ],
@@ -804,12 +1106,24 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                   ButtonSegment(
                     value: 0,
                     icon: Icon(Icons.account_tree_outlined, size: 16),
-                    label: Text('MULTI AGENT TEST', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                    label: Text(
+                      'MULTI AGENT TEST',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
                   ),
                   ButtonSegment(
                     value: 1,
                     icon: Icon(Icons.speed, size: 16),
-                    label: Text('BENCHMARK SINGLE VLM', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                    label: Text(
+                      'BENCHMARK SINGLE VLM',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
                   ),
                 ],
                 selected: {_activeSubTab},
@@ -861,16 +1175,31 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('ON-DEVICE ENGINES',
-                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey)),
+                    const Text(
+                      'ON-DEVICE ENGINES',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.grey,
+                      ),
+                    ),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
                       decoration: BoxDecoration(
                         color: Colors.green.withAlpha(40),
                         borderRadius: BorderRadius.circular(4),
                       ),
-                      child: const Text('LITERT-LM ON-DEVICE',
-                          style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.greenAccent)),
+                      child: const Text(
+                        'LITERT-LM ON-DEVICE',
+                        style: TextStyle(
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.greenAccent,
+                        ),
+                      ),
                     ),
                   ],
                 ),
@@ -881,10 +1210,21 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                       child: _buildEngineStatusItem(
                         name: 'SmolVLM2 (500M)',
                         role: 'FAST Vision',
-                        status: _engineManager.currentlyLoadedModelKey == VlmModelInfo.smolVlm2.key && _status.isLoaded
+                        status:
+                            _engineManager.currentlyLoadedModelKey ==
+                                    VlmModelInfo.smolVlm2.key &&
+                                _status.isLoaded
                             ? 'Sẵn sàng trong RAM'
-                            : (_status.modelsAvailable[VlmModelInfo.smolVlm2.key] == true ? 'Sẵn có (Unloaded)' : 'Chưa có file'),
-                        color: _engineManager.currentlyLoadedModelKey == VlmModelInfo.smolVlm2.key && _status.isLoaded
+                            : (_status.modelsAvailable[VlmModelInfo
+                                          .smolVlm2
+                                          .key] ==
+                                      true
+                                  ? 'Sẵn có (Unloaded)'
+                                  : 'Chưa có file'),
+                        color:
+                            _engineManager.currentlyLoadedModelKey ==
+                                    VlmModelInfo.smolVlm2.key &&
+                                _status.isLoaded
                             ? Colors.greenAccent
                             : Colors.amberAccent,
                       ),
@@ -894,10 +1234,21 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                       child: _buildEngineStatusItem(
                         name: 'Gemma-4-E2B',
                         role: 'DEEP Reasoning',
-                        status: _engineManager.currentlyLoadedModelKey == VlmModelInfo.gemma4.key && _status.isLoaded
+                        status:
+                            _engineManager.currentlyLoadedModelKey ==
+                                    VlmModelInfo.gemma4.key &&
+                                _status.isLoaded
                             ? 'Sẵn sàng trong RAM'
-                            : (_status.modelsAvailable[VlmModelInfo.gemma4.key] == true ? 'Sẵn có (Unloaded)' : 'Chưa có file'),
-                        color: _engineManager.currentlyLoadedModelKey == VlmModelInfo.gemma4.key && _status.isLoaded
+                            : (_status.modelsAvailable[VlmModelInfo
+                                          .gemma4
+                                          .key] ==
+                                      true
+                                  ? 'Sẵn có (Unloaded)'
+                                  : 'Chưa có file'),
+                        color:
+                            _engineManager.currentlyLoadedModelKey ==
+                                    VlmModelInfo.gemma4.key &&
+                                _status.isLoaded
                             ? Colors.greenAccent
                             : Colors.blueGrey,
                       ),
@@ -908,23 +1259,38 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                 // SenseGraph live counter
                 Row(
                   children: [
-                    const Icon(Icons.bubble_chart_outlined, size: 16, color: Color(0xFF7F5AF0)),
+                    const Icon(
+                      Icons.bubble_chart_outlined,
+                      size: 16,
+                      color: Color(0xFF7F5AF0),
+                    ),
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
                         'SenseGraph: $viewCount Views | $objCount Objects | $textCount Texts | $edgeCount Edges',
-                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ),
                     InkWell(
                       onTap: () {
                         Navigator.push(
                           context,
-                          MaterialPageRoute(builder: (_) => const SenseGraphViewerPage()),
+                          MaterialPageRoute(
+                            builder: (_) => const SenseGraphViewerPage(),
+                          ),
                         ).then((_) => setState(() {}));
                       },
-                      child: const Text('Chi tiết >',
-                          style: TextStyle(fontSize: 11, color: Color(0xFF7F5AF0), fontWeight: FontWeight.bold)),
+                      child: const Text(
+                        'Chi tiết >',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Color(0xFF7F5AF0),
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
                     ),
                     const SizedBox(width: 8),
                     InkWell(
@@ -932,7 +1298,11 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                         await _graphManager.clear();
                         setState(() {});
                       },
-                      child: const Icon(Icons.delete_sweep_outlined, size: 16, color: Colors.grey),
+                      child: const Icon(
+                        Icons.delete_sweep_outlined,
+                        size: 16,
+                        color: Colors.grey,
+                      ),
                     ),
                   ],
                 ),
@@ -949,8 +1319,14 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
 
         const SizedBox(height: 16),
         // Agent Action Grid / Fast Test Buttons
-        const Text('KIỂM THỬ NHANH TỪNG VAI TRÒ AGENT:',
-            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey)),
+        const Text(
+          'KIỂM THỬ NHANH TỪNG VAI TRÒ AGENT:',
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.bold,
+            color: Colors.grey,
+          ),
+        ),
         const SizedBox(height: 8),
         Wrap(
           spacing: 8,
@@ -961,35 +1337,45 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               sublabel: 'SmolVLM Fast',
               icon: Icons.landscape_outlined,
               color: const Color(0xFF2CB67D),
-              onTap: _isAgentRunning ? null : () => _executeAgentTask(AgentTask.describeScene),
+              onTap: _isAgentRunning
+                  ? null
+                  : () => _executeAgentTask(AgentTask.describeScene),
             ),
             _buildAgentButton(
               label: 'Check Hazard',
               sublabel: 'Rule + SmolVLM',
               icon: Icons.warning_amber_rounded,
               color: const Color(0xFFE53170),
-              onTap: _isAgentRunning ? null : () => _executeAgentTask(AgentTask.detectHazard),
+              onTap: _isAgentRunning
+                  ? null
+                  : () => _executeAgentTask(AgentTask.detectHazard),
             ),
             _buildAgentButton(
               label: 'Read Text',
               sublabel: 'ML Kit OCR',
               icon: Icons.text_fields_outlined,
               color: const Color(0xFFFF8906),
-              onTap: _isAgentRunning ? null : () => _executeAgentTask(AgentTask.readText),
+              onTap: _isAgentRunning
+                  ? null
+                  : () => _executeAgentTask(AgentTask.readText),
             ),
             _buildAgentButton(
               label: 'Explain Text',
               sublabel: 'Gemma 4 E2B',
               icon: Icons.translate_outlined,
               color: const Color(0xFF7F5AF0),
-              onTap: _isAgentRunning ? null : () => _executeAgentTask(AgentTask.explainText),
+              onTap: _isAgentRunning
+                  ? null
+                  : () => _executeAgentTask(AgentTask.explainText),
             ),
             _buildAgentButton(
               label: 'Spatial Relations',
               sublabel: 'SmolVLM Graph',
               icon: Icons.share_outlined,
               color: const Color(0xFF00B4D8),
-              onTap: _isAgentRunning ? null : () => _executeAgentTask(AgentTask.extractRelations),
+              onTap: _isAgentRunning
+                  ? null
+                  : () => _executeAgentTask(AgentTask.extractRelations),
             ),
           ],
         ),
@@ -999,7 +1385,9 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
         Card(
           elevation: 1,
           color: const Color(0xFF16161A),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
           child: Padding(
             padding: const EdgeInsets.all(12),
             child: Column(
@@ -1007,33 +1395,66 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               children: [
                 const Row(
                   children: [
-                    Icon(Icons.psychology_alt_outlined, size: 18, color: Color(0xFF7F5AF0)),
+                    Icon(
+                      Icons.psychology_alt_outlined,
+                      size: 18,
+                      color: Color(0xFF7F5AF0),
+                    ),
                     SizedBox(width: 6),
-                    Text('Hỏi đáp ngữ cảnh (ReasoningAgent - Gemma 4):',
-                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                    Text(
+                      'Hỏi đáp ngữ cảnh (ReasoningAgent - Gemma 4):',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
                   ],
                 ),
                 const SizedBox(height: 8),
-                TextField(
-                  controller: _agentQueryController,
-                  maxLines: 2,
-                  decoration: InputDecoration(
-                    hintText: 'Nhập câu hỏi không gian / chướng ngại vật / văn bản...',
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                    filled: true,
-                    fillColor: const Color(0xFF0F0E17),
-                    isDense: true,
-                  ),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _agentQueryController,
+                        maxLines: 2,
+                        decoration: InputDecoration(
+                          hintText:
+                              'Nhập câu hỏi không gian / chướng ngại vật / văn bản...',
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          filled: true,
+                          fillColor: const Color(0xFF0F0E17),
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: _isListening
+                          ? 'Dừng nghe'
+                          : 'Hỏi bằng giọng nói',
+                      onPressed: _isAgentRunning ? null : _toggleVoiceQuery,
+                      icon: Icon(
+                        _isListening ? Icons.mic : Icons.mic_none,
+                        color: _isListening ? Colors.redAccent : null,
+                      ),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 8),
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton.icon(
-                    onPressed: _isAgentRunning ? null : () => _executeAgentTask(AgentTask.complexQuestion),
+                    onPressed: _isAgentRunning
+                        ? _cancelAgentTask
+                        : _routeAndExecuteQuery,
                     icon: _isAgentRunning
-                        ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                        ? const Icon(Icons.stop_rounded, size: 16)
                         : const Icon(Icons.send_rounded, size: 16),
-                    label: const Text('Complex Question (ReasoningAgent + Subgraph)'),
+                    label: Text(
+                      _isAgentRunning ? 'Dừng suy luận' : 'Định tuyến câu hỏi',
+                    ),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF7F5AF0),
                       foregroundColor: Colors.white,
@@ -1047,7 +1468,9 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
 
         const SizedBox(height: 16),
         // Agent Execution Results
-        if (_isAgentRunning || _agentVlmOutput != null || _agentRuleOutput != null)
+        if (_isAgentRunning ||
+            _agentVlmOutput != null ||
+            _agentRuleOutput != null)
           _buildAgentOutputCard(),
       ],
     );
@@ -1071,17 +1494,57 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
         children: [
           Row(
             children: [
-              Container(width: 8, height: 8, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+              ),
               const SizedBox(width: 6),
               Expanded(
-                child: Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                child: Text(
+                  name,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
               ),
+              if (_agentRawResponse?.isNotEmpty == true)
+                ExpansionTile(
+                  tilePadding: EdgeInsets.zero,
+                  title: const Text(
+                    'Raw model output (diagnostic)',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  children: [
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: SelectableText(
+                        _agentRawResponse!,
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
             ],
           ),
           const SizedBox(height: 2),
-          Text(role, style: TextStyle(fontSize: 10, color: Colors.grey.shade400)),
+          Text(
+            role,
+            style: TextStyle(fontSize: 10, color: Colors.grey.shade400),
+          ),
           const SizedBox(height: 2),
-          Text(status, style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.w600)),
+          Text(
+            status,
+            style: TextStyle(
+              fontSize: 10,
+              color: color,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ],
       ),
     );
@@ -1113,8 +1576,17 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                Text(sublabel, style: TextStyle(fontSize: 9, color: Colors.grey.shade400)),
+                Text(
+                  label,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                Text(
+                  sublabel,
+                  style: TextStyle(fontSize: 9, color: Colors.grey.shade400),
+                ),
               ],
             ),
           ],
@@ -1146,11 +1618,17 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                     children: [
                       Text(
                         'Task: ${_selectedAgentTask.displayName}',
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                        ),
                       ),
                       Text(
                         'Agent: $_lastAgentName | Engine: $_lastEngineUsed',
-                        style: TextStyle(fontSize: 11, color: Colors.grey.shade400),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey.shade400,
+                        ),
                       ),
                     ],
                   ),
@@ -1180,12 +1658,20 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                   children: [
                     const Text(
                       'TỨC THÌ (RULE-BASED SAFETY OUTPUT < 5ms):',
-                      style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.redAccent),
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.redAccent,
+                      ),
                     ),
                     const SizedBox(height: 4),
                     Text(
                       _agentRuleOutput!,
-                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.white),
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
                     ),
                   ],
                 ),
@@ -1198,13 +1684,21 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               const Center(
                 child: Padding(
                   padding: EdgeInsets.symmetric(vertical: 12),
-                  child: Text('Đang xử lý on-device (LiteRT-LM / OCR)...',
-                      style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  child: Text(
+                    'Đang xử lý on-device (LiteRT-LM / OCR)...',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
                 ),
               )
             else if (_agentVlmOutput != null) ...[
-              const Text('KẾT QUẢ TỪ VLM / AGENT:',
-                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF7F5AF0))),
+              const Text(
+                'KẾT QUẢ TỪ VLM / AGENT:',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF7F5AF0),
+                ),
+              ),
               const SizedBox(height: 6),
               Container(
                 width: double.infinity,
@@ -1224,8 +1718,14 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
             // Latency Breakdown
             if (_agentLatencies.isNotEmpty) ...[
               const SizedBox(height: 10),
-              const Text('LATENCY BREAKDOWN:',
-                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
+              const Text(
+                'LATENCY BREAKDOWN:',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey,
+                ),
+              ),
               const SizedBox(height: 4),
               Wrap(
                 spacing: 12,
@@ -1233,7 +1733,11 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                 children: _agentLatencies.entries.map((e) {
                   return Text(
                     '${e.key}: ${e.value.toStringAsFixed(0)} ms',
-                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: Colors.greenAccent),
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.greenAccent,
+                    ),
                   );
                 }).toList(),
               ),
@@ -1263,7 +1767,8 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
         const SizedBox(height: 16),
         _buildActionButtons(),
         const SizedBox(height: 16),
-        if (_lastResult != null || _isInferring || _isBenchmarking) _buildResultCard(),
+        if (_lastResult != null || _isInferring || _isBenchmarking)
+          _buildResultCard(),
         const SizedBox(height: 16),
         _buildBenchmarkMetricsCard(),
       ],
@@ -1272,8 +1777,10 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
 
   Widget _buildStatusCard() {
     final currentModelInfo = VlmModelInfo.fromKey(_selectedModelKey);
-    final modelExists = _status.modelsAvailable[_selectedModelKey] ?? _status.modelExists;
-    final isCurrentModelLoaded = _status.isLoaded && _status.loadedModelKey == _selectedModelKey;
+    final modelExists =
+        _status.modelsAvailable[_selectedModelKey] ?? _status.modelExists;
+    final isCurrentModelLoaded =
+        _status.isLoaded && _status.loadedModelKey == _selectedModelKey;
 
     final Color statusColor;
     final String statusText;
@@ -1281,7 +1788,9 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
 
     if (_isCheckingStatus || _isLoadingModel) {
       statusColor = Colors.orange;
-      statusText = _isLoadingModel ? 'NẠP MODEL VÀO RAM/VRAM...' : 'KIỂM TRA TRẠNG THÁI...';
+      statusText = _isLoadingModel
+          ? 'NẠP MODEL VÀO RAM/VRAM...'
+          : 'KIỂM TRA TRẠNG THÁI...';
       statusIcon = Icons.hourglass_top;
     } else if (_isInferring) {
       statusColor = const Color(0xFF7F5AF0);
@@ -1333,7 +1842,10 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                 ),
                 if (!isCurrentModelLoaded && modelExists)
                   ElevatedButton.icon(
-                    onPressed: (_isLoadingModel || _isInferring || _isBenchmarking) ? null : _initializeModel,
+                    onPressed:
+                        (_isLoadingModel || _isInferring || _isBenchmarking)
+                        ? null
+                        : _initializeModel,
                     icon: _isLoadingModel
                         ? const SizedBox(
                             width: 14,
@@ -1341,9 +1853,15 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
                         : const Icon(Icons.flash_on, size: 16),
-                    label: const Text('Load / Warm', style: TextStyle(fontSize: 12)),
+                    label: const Text(
+                      'Load / Warm',
+                      style: TextStyle(fontSize: 12),
+                    ),
                     style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
                     ),
                   ),
               ],
@@ -1372,13 +1890,20 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                   children: [
                     Text(
                       'Cách nạp file ${currentModelInfo.filename} vào máy:',
-                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
                     ),
                     const SizedBox(height: 4),
                     SelectableText(
                       'adb push ${currentModelInfo.filename} /data/local/tmp/\n'
                       'adb shell run-as com.example.android_ai_gateway cp /data/local/tmp/${currentModelInfo.filename} files/models/',
-                      style: TextStyle(fontFamily: 'monospace', fontSize: 10, color: Colors.amber.shade200),
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 10,
+                        color: Colors.amber.shade200,
+                      ),
                     ),
                   ],
                 ),
@@ -1410,15 +1935,14 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
           ? Stack(
               fit: StackFit.expand,
               children: [
-                Image.file(
-                  File(_selectedImagePath!),
-                  fit: BoxFit.contain,
-                ),
+                Image.file(File(_selectedImagePath!), fit: BoxFit.contain),
                 Positioned(
                   top: 8,
                   right: 8,
                   child: IconButton.filled(
-                    style: IconButton.styleFrom(backgroundColor: Colors.black54),
+                    style: IconButton.styleFrom(
+                      backgroundColor: Colors.black54,
+                    ),
                     icon: const Icon(Icons.close, size: 18),
                     onPressed: () {
                       setState(() {
@@ -1427,6 +1951,7 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                         _lastBenchmarkReport = null;
                         _agentRuleOutput = null;
                         _agentVlmOutput = null;
+                        _agentRawResponse = null;
                         _lastOcrItems = [];
                       });
                     },
@@ -1438,7 +1963,11 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(Icons.add_photo_alternate_outlined, size: 44, color: Colors.grey.shade600),
+                  Icon(
+                    Icons.add_photo_alternate_outlined,
+                    size: 44,
+                    color: Colors.grey.shade600,
+                  ),
                   const SizedBox(height: 8),
                   Text(
                     'Chưa chọn ảnh để phân tích',
@@ -1492,7 +2021,10 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Model VLM:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                  const Text(
+                    'Model VLM:',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                  ),
                   const SizedBox(height: 4),
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -1506,15 +2038,21 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                         value: _selectedModelKey,
                         isExpanded: true,
                         items: VlmModelInfo.supportedModels.map((m) {
-                          final isAvail = _status.modelsAvailable[m.key] ?? false;
+                          final isAvail =
+                              _status.modelsAvailable[m.key] ?? false;
                           return DropdownMenuItem<String>(
                             value: m.key,
                             child: Row(
                               children: [
-                                Text(m.displayName, style: const TextStyle(fontSize: 13)),
+                                Text(
+                                  m.displayName,
+                                  style: const TextStyle(fontSize: 13),
+                                ),
                                 const Spacer(),
                                 Icon(
-                                  isAvail ? Icons.check_circle : Icons.cloud_download,
+                                  isAvail
+                                      ? Icons.check_circle
+                                      : Icons.cloud_download,
                                   size: 14,
                                   color: isAvail ? Colors.green : Colors.grey,
                                 ),
@@ -1543,7 +2081,10 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Max Tokens:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                const Text(
+                  'Max Tokens:',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                ),
                 const SizedBox(height: 4),
                 DropdownButton<int>(
                   value: _selectedMaxTokens,
@@ -1570,13 +2111,28 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
         Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Backend:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+            const Text(
+              'Backend:',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 4),
             SegmentedButton<String>(
               segments: const [
-                ButtonSegment(value: 'AUTO', label: Text('AUTO (Mali-G610)', style: TextStyle(fontSize: 11))),
-                ButtonSegment(value: 'GPU', label: Text('GPU', style: TextStyle(fontSize: 11))),
-                ButtonSegment(value: 'CPU', label: Text('CPU', style: TextStyle(fontSize: 11))),
+                ButtonSegment(
+                  value: 'AUTO',
+                  label: Text(
+                    'AUTO (Mali-G610)',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ),
+                ButtonSegment(
+                  value: 'GPU',
+                  label: Text('GPU', style: TextStyle(fontSize: 11)),
+                ),
+                ButtonSegment(
+                  value: 'CPU',
+                  label: Text('CPU', style: TextStyle(fontSize: 11)),
+                ),
               ],
               selected: {_selectedBackend},
               onSelectionChanged: (_isInferring || _isBenchmarking)
@@ -1600,7 +2156,10 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text('Prompt:', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+            const Text(
+              'Prompt:',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
             PopupMenuButton<String>(
               icon: const Row(
                 mainAxisSize: MainAxisSize.min,
@@ -1617,7 +2176,9 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               },
               itemBuilder: (context) {
                 return _promptPresets.map((preset) {
-                  final title = preset.length > 40 ? '${preset.substring(0, 40)}...' : preset;
+                  final title = preset.length > 40
+                      ? '${preset.substring(0, 40)}...'
+                      : preset;
                   return PopupMenuItem<String>(
                     value: preset,
                     child: Text(title, style: const TextStyle(fontSize: 12)),
@@ -1643,8 +2204,11 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
   }
 
   Widget _buildActionButtons() {
-    final disabled = _isInferring || _isBenchmarking || _selectedImagePath == null;
-    final currentModelName = VlmModelInfo.fromKey(_selectedModelKey).displayName;
+    final disabled =
+        _isInferring || _isBenchmarking || _selectedImagePath == null;
+    final currentModelName = VlmModelInfo.fromKey(
+      _selectedModelKey,
+    ).displayName;
 
     return Row(
       children: [
@@ -1658,17 +2222,25 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                   ? const SizedBox(
                       width: 18,
                       height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
                     )
                   : const Icon(Icons.auto_awesome),
               label: Text(
                 _isInferring ? 'Đang suy luận...' : 'Run ($currentModelName)',
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                ),
               ),
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFF7F5AF0),
                 foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
               ),
             ),
           ),
@@ -1679,20 +2251,21 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
           child: SizedBox(
             height: 48,
             child: OutlinedButton.icon(
-              onPressed: disabled ? null : _runBenchmarkX5,
-              icon: _isBenchmarking
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.speed, size: 18),
-              label: const Text(
-                'BENCH x5',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+              onPressed: _isInferring
+                  ? _vlmService.cancel
+                  : (disabled ? null : _runBenchmarkX5),
+              icon: Icon(_isInferring ? Icons.stop : Icons.speed, size: 18),
+              label: Text(
+                _isInferring ? 'CANCEL' : 'BENCH x5',
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                ),
               ),
               style: OutlinedButton.styleFrom(
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
               ),
             ),
           ),
@@ -1712,11 +2285,18 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
           children: [
             Row(
               children: [
-                const Icon(Icons.chat_bubble_outline, size: 18, color: Color(0xFF7F5AF0)),
+                const Icon(
+                  Icons.chat_bubble_outline,
+                  size: 18,
+                  color: Color(0xFF7F5AF0),
+                ),
                 const SizedBox(width: 8),
                 Text(
                   'Kết quả VLM Output (${VlmModelInfo.fromKey(_selectedModelKey).displayName}):',
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
                 ),
               ],
             ),
@@ -1729,6 +2309,16 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
                     children: [
                       const CircularProgressIndicator(),
                       const SizedBox(height: 10),
+                      if (_isInferring && _streamingText.isNotEmpty)
+                        SelectableText(
+                          _streamingText,
+                          style: const TextStyle(
+                            fontSize: 14,
+                            height: 1.4,
+                            color: Colors.white,
+                          ),
+                        ),
+                      const SizedBox(height: 10),
                       Text(
                         _isBenchmarking
                             ? 'Đang thực hiện Benchmark 5 vòng liên tiếp...'
@@ -1740,7 +2330,9 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               )
             else if (_lastResult != null)
               SelectableText(
-                _lastResult!.success ? _lastResult!.text : 'Lỗi: ${_lastResult!.message ?? _lastResult!.error}',
+                _lastResult!.success
+                    ? _lastResult!.text
+                    : 'Lỗi: ${_lastResult!.message ?? _lastResult!.error}',
                 style: TextStyle(
                   fontSize: 14,
                   height: 1.4,
@@ -1769,11 +2361,14 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               children: [
                 const Icon(Icons.speed, size: 18, color: Colors.blueAccent),
                 const SizedBox(width: 8),
-                const Text(
-                  'Benchmark & Performance Metrics',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                const Expanded(
+                  child: Text(
+                    'Benchmark & Performance Metrics',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                  ),
                 ),
-                const Spacer(),
                 if (report != null)
                   TextButton.icon(
                     icon: const Icon(Icons.table_chart, size: 14),
@@ -1783,7 +2378,10 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               ],
             ),
             const Divider(),
-            _buildMetricRow('Model', VlmModelInfo.fromKey(_selectedModelKey).displayName),
+            _buildMetricRow(
+              'Model',
+              VlmModelInfo.fromKey(_selectedModelKey).displayName,
+            ),
             _buildMetricRow(
               'Backend thực tế',
               res != null
@@ -1794,8 +2392,8 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               'Model Load',
               res != null
                   ? (res.isWarm
-                      ? '0 ms (Cached / Warm in RAM)'
-                      : '${res.modelLoadMs.toStringAsFixed(0)} ms (Cold start)')
+                        ? '0 ms (Cached / Warm in RAM)'
+                        : '${res.modelLoadMs.toStringAsFixed(0)} ms (Cold start)')
                   : (_status.isLoaded ? 'Sẵn sàng trong RAM' : 'Chưa nạp'),
             ),
             _buildMetricRow(
@@ -1803,6 +2401,18 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
               res?.timeToFirstTokenMs != null
                   ? '${res!.timeToFirstTokenMs!.toStringAsFixed(1)} ms'
                   : (res != null ? 'Đo qua streaming flow' : '-'),
+            ),
+            _buildMetricRow(
+              'Vision encode',
+              res?.visionEncodeMs == null
+                  ? 'Không có metric riêng từ SDK'
+                  : '${res!.visionEncodeMs!.toStringAsFixed(1)} ms',
+            ),
+            _buildMetricRow(
+              'Decode (ms/token)',
+              res?.decodeMsPerToken == null
+                  ? '-'
+                  : '${res!.decodeMsPerToken!.toStringAsFixed(1)} ms/token',
             ),
             _buildMetricRow(
               'Tốc độ sinh (Tokens/s)',
@@ -1816,7 +2426,9 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
             ),
             _buildMetricRow(
               'Total Inference Time',
-              res != null ? '${res.totalInferenceMs.toStringAsFixed(1)} ms' : '-',
+              res != null
+                  ? '${res.totalInferenceMs.toStringAsFixed(1)} ms'
+                  : '-',
             ),
             _buildMetricRow(
               'Tokens đã sinh',
@@ -1840,8 +2452,14 @@ Các nút SenseGraph đã tham chiếu: ${result.referencedNodes.isEmpty ? "None
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: TextStyle(fontSize: 12, color: Colors.grey.shade400)),
-          Text(value, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+          Text(
+            label,
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade400),
+          ),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
         ],
       ),
     );

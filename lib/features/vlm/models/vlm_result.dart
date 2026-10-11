@@ -21,6 +21,14 @@ class VlmModelInfo {
     recommendedInputResolution: 512,
   );
 
+  static const VlmModelInfo smolVlm2Vietnamese = VlmModelInfo(
+    key: 'smolvlm2_500m_vi_lora',
+    displayName: 'SmolVLM2-500M Vietnamese',
+    filename: 'SmolVLM2-500M-VI.litertlm',
+    defaultBackend: 'AUTO',
+    recommendedInputResolution: 384,
+  );
+
   static const VlmModelInfo gemma4 = VlmModelInfo(
     key: 'gemma_4_e2b',
     displayName: 'Gemma-4-E2B-it',
@@ -31,6 +39,7 @@ class VlmModelInfo {
 
   static const List<VlmModelInfo> supportedModels = [
     smolVlm2,
+    smolVlm2Vietnamese,
     gemma4,
   ];
 
@@ -110,6 +119,9 @@ class VlmResult {
   final double modelLoadMs;
   final double preprocessMs;
   final double? timeToFirstTokenMs;
+  final double? sdkTimeToFirstTokenMs;
+  final double? visionEncodeMs;
+  final double? decodeMsPerToken;
   final double generationMs;
   final double totalInferenceMs;
   final int generatedTokens;
@@ -129,6 +141,9 @@ class VlmResult {
     required this.modelLoadMs,
     required this.preprocessMs,
     this.timeToFirstTokenMs,
+    this.sdkTimeToFirstTokenMs,
+    this.visionEncodeMs,
+    this.decodeMsPerToken,
     required this.generationMs,
     required this.totalInferenceMs,
     required this.generatedTokens,
@@ -146,7 +161,7 @@ class VlmResult {
   factory VlmResult.fromMap(Map<dynamic, dynamic> map) {
     final genTokens = (map['generatedTokens'] as num?)?.toInt() ?? 0;
     final genMs = (map['generationMs'] as num?)?.toDouble() ?? 0.0;
-    
+
     // Compute tokens per second if not provided
     double tps = (map['tokensPerSecond'] as num?)?.toDouble() ?? 0.0;
     if (tps <= 0.0 && genMs > 0 && genTokens > 0) {
@@ -159,6 +174,9 @@ class VlmResult {
       modelLoadMs: (map['modelLoadMs'] as num?)?.toDouble() ?? 0.0,
       preprocessMs: (map['preprocessMs'] as num?)?.toDouble() ?? 0.0,
       timeToFirstTokenMs: (map['timeToFirstTokenMs'] as num?)?.toDouble(),
+      sdkTimeToFirstTokenMs: (map['sdkTimeToFirstTokenMs'] as num?)?.toDouble(),
+      visionEncodeMs: (map['visionEncodeMs'] as num?)?.toDouble(),
+      decodeMsPerToken: (map['decodeMsPerToken'] as num?)?.toDouble(),
       generationMs: genMs,
       totalInferenceMs: (map['totalInferenceMs'] as num?)?.toDouble() ?? 0.0,
       generatedTokens: genTokens,
@@ -166,7 +184,9 @@ class VlmResult {
       backend: map['backend']?.toString() ?? 'UNKNOWN',
       requestedBackend: map['requestedBackend']?.toString() ?? 'AUTO',
       modelKey: map['modelKey']?.toString() ?? 'smolvlm2_500m',
-      isWarm: map['isWarm'] == true || (map['modelLoadMs'] as num?)?.toDouble() == 0.0,
+      isWarm:
+          map['isWarm'] == true ||
+          (map['modelLoadMs'] as num?)?.toDouble() == 0.0,
       nativeHeapMb: (map['nativeHeapMb'] as num?)?.toDouble() ?? 0.0,
       javaHeapMb: (map['javaHeapMb'] as num?)?.toDouble() ?? 0.0,
       error: map['error']?.toString(),
@@ -185,6 +205,9 @@ class VlmResult {
       modelLoadMs: 0,
       preprocessMs: 0,
       timeToFirstTokenMs: null,
+      sdkTimeToFirstTokenMs: null,
+      visionEncodeMs: null,
+      decodeMsPerToken: null,
       generationMs: 0,
       totalInferenceMs: 0,
       generatedTokens: 0,

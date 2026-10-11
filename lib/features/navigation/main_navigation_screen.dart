@@ -2,6 +2,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
 import '../camera/presentation/camera_screen.dart';
+import '../visual_slam/presentation/visual_slam_screen.dart';
 import '../vlm/presentation/vlm_test_page.dart';
 
 class MainNavigationScreen extends StatefulWidget {
@@ -23,6 +24,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         index: _currentIndex,
         children: [
           CameraScreen(cameras: widget.cameras),
+          const VisualSlamScreen(),
           const VlmTestPage(),
         ],
       ),
@@ -40,6 +42,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
             label: 'YOLO Camera',
           ),
           NavigationDestination(
+            icon: Icon(Icons.hub_outlined),
+            selectedIcon: Icon(Icons.hub),
+            label: 'Visual SLAM',
+          ),
+          NavigationDestination(
             icon: Icon(Icons.psychology_outlined),
             selectedIcon: Icon(Icons.psychology),
             label: 'VLM Test',
@@ -49,3 +56,4 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
   }
 }
+

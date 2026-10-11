@@ -11,7 +11,11 @@ import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
+import com.google.ai.edge.litertlm.ResponseFormat
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -23,11 +27,46 @@ class VlmNativeService(private val context: Context) {
         private const val TAG = "VLM"
 
         const val MODEL_KEY_SMOLVLM = "smolvlm2_500m"
+        const val MODEL_KEY_SMOLVLM_VI = "smolvlm2_500m_vi_lora"
         const val MODEL_KEY_GEMMA = "gemma_4_e2b"
 
         const val FILENAME_SMOLVLM = "SmolVLM2-500M.litertlm"
+        const val FILENAME_SMOLVLM_VI = "SmolVLM2-500M-VI.litertlm"
         const val FILENAME_GEMMA_GPU = "gemma-4-E2B-it-gpu.litertlm"
         const val FILENAME_GEMMA_CPU = "gemma-4-E2B-it.litertlm"
+
+        private val STRUCTURED_SCENE_SCHEMA = """
+            {
+              "type":"object",
+              "properties":{
+                "OBJECT":{"type":"string","enum":["person","car","motorcycle","bicycle","bus","truck","dog","stairs","door","obstacle","other","none"]},
+                "ACTION":{"type":"string","enum":["approaching","walking","crossing","stopped","moving","none"]},
+                "DIRECTION":{"type":"string","enum":["front","left","right","front_left","front_right","behind","unknown"]},
+                "DISTANCE":{"type":"string","enum":["near","medium","far","unknown"]},
+                "RISK":{"type":"string","enum":["high","medium","low","none"]},
+                "TEXT":{"type":"string"}
+              },
+              "required":["OBJECT","ACTION","DIRECTION","DISTANCE","RISK","TEXT"],
+              "additionalProperties":false
+            }
+        """.trimIndent()
+
+        private val STRUCTURED_HAZARD_SCHEMA = """
+            {
+              "type":"object",
+              "properties":{
+                "hazard":{"type":"boolean"},
+                "OBJECT":{"type":"string","enum":["person","car","motorcycle","bicycle","bus","truck","dog","stairs","door","obstacle","other","none"]},
+                "ACTION":{"type":"string","enum":["approaching","walking","crossing","stopped","moving","none"]},
+                "DIRECTION":{"type":"string","enum":["front","left","right","front_left","front_right","behind","unknown"]},
+                "DISTANCE":{"type":"string","enum":["near","medium","far","unknown"]},
+                "RISK":{"type":"string","enum":["high","medium","low","none"]},
+                "TEXT":{"type":"string"}
+              },
+              "required":["hazard","OBJECT","ACTION","DIRECTION","DISTANCE","RISK","TEXT"],
+              "additionalProperties":false
+            }
+        """.trimIndent()
 
         @Volatile
         private var instance: VlmNativeService? = null
@@ -47,10 +86,23 @@ class VlmNativeService(private val context: Context) {
 
     private val isInferring = AtomicBoolean(false)
     private val mutex = Mutex()
+    @Volatile private var activeConversation: Conversation? = null
+
+    @OptIn(ExperimentalApi::class)
+    private fun createInitializedEngine(config: EngineConfig): Engine {
+        val benchmarkWasEnabled = ExperimentalFlags.enableBenchmark
+        ExperimentalFlags.enableBenchmark = true
+        return try {
+            Engine(config).also { it.initialize() }
+        } finally {
+            ExperimentalFlags.enableBenchmark = benchmarkWasEnabled
+        }
+    }
 
     private fun getCandidateFilenames(modelKey: String): List<String> {
         return when (modelKey) {
             MODEL_KEY_GEMMA -> listOf(FILENAME_GEMMA_GPU, FILENAME_GEMMA_CPU)
+            MODEL_KEY_SMOLVLM_VI -> listOf(FILENAME_SMOLVLM_VI)
             else -> listOf(FILENAME_SMOLVLM)
         }
     }
@@ -93,18 +145,18 @@ class VlmNativeService(private val context: Context) {
 
     fun getStatus(modelKey: String = MODEL_KEY_SMOLVLM): Map<String, Any?> {
         val smolExists = findExistingModelFile(MODEL_KEY_SMOLVLM) != null
+        val smolViExists = findExistingModelFile(MODEL_KEY_SMOLVLM_VI) != null
         val gemmaExists = findExistingModelFile(MODEL_KEY_GEMMA) != null
 
-        val targetKey = if (engine != null && loadedModelKey != null) loadedModelKey!! else modelKey
-        val foundFile = findExistingModelFile(targetKey)
-        val expectedPath = foundFile?.absolutePath ?: getExpectedModelPath(targetKey)
+        val foundFile = findExistingModelFile(modelKey)
+        val expectedPath = foundFile?.absolutePath ?: getExpectedModelPath(modelKey)
+        val isRequestedModelLoaded = engine != null && loadedModelKey == modelKey
         val fileExists = foundFile != null
-        val isLoaded = engine != null
 
         return mapOf(
-            "isLoaded" to isLoaded,
-            "loadedModelKey" to (loadedModelKey ?: targetKey),
-            "modelPath" to (loadedModelPath ?: expectedPath),
+            "isLoaded" to isRequestedModelLoaded,
+            "loadedModelKey" to (loadedModelKey ?: modelKey),
+            "modelPath" to if (isRequestedModelLoaded) loadedModelPath ?: expectedPath else expectedPath,
             "modelExists" to fileExists,
             "requestedBackend" to requestedBackend,
             "actualBackend" to activeBackend,
@@ -113,6 +165,7 @@ class VlmNativeService(private val context: Context) {
             "isInferring" to isInferring.get(),
             "modelsAvailable" to mapOf(
                 MODEL_KEY_SMOLVLM to smolExists,
+                MODEL_KEY_SMOLVLM_VI to smolViExists,
                 MODEL_KEY_GEMMA to gemmaExists
             )
         )
@@ -160,12 +213,10 @@ class VlmNativeService(private val context: Context) {
             )
         }
 
-        // When switching models or backends, explicitly unload previous engine and run GC
+        // When switching models or backends, explicitly unload previous engine
         if (engine != null) {
             Log.i(TAG, "[VLM] Unloading previous model ($loadedModelKey on $activeBackend) before loading $modelKey...")
             unloadInternal()
-            System.gc()
-            System.runFinalization()
         }
 
         requestedBackend = backendPref
@@ -185,8 +236,7 @@ class VlmNativeService(private val context: Context) {
                     visionBackend = Backend.GPU(),
                     maxNumImages = 1
                 )
-                val testEngine = Engine(gpuConfig)
-                testEngine.initialize()
+                val testEngine = createInitializedEngine(gpuConfig)
                 createdEngine = testEngine
                 initializedBackend = "GPU"
                 Log.i(TAG, "[VLM] Full GPU initialization succeeded for $modelKey")
@@ -199,8 +249,7 @@ class VlmNativeService(private val context: Context) {
                         visionBackend = Backend.CPU(),
                         maxNumImages = 1
                     )
-                    val testEngine = Engine(gpuCpuConfig)
-                    testEngine.initialize()
+                    val testEngine = createInitializedEngine(gpuCpuConfig)
                     createdEngine = testEngine
                     initializedBackend = "GPU (Vision CPU)"
                     Log.i(TAG, "[VLM] GPU text + CPU vision succeeded for $modelKey")
@@ -219,8 +268,7 @@ class VlmNativeService(private val context: Context) {
                     visionBackend = Backend.CPU(),
                     maxNumImages = 1
                 )
-                val cpuEngine = Engine(cpuConfig)
-                cpuEngine.initialize()
+                val cpuEngine = createInitializedEngine(cpuConfig)
                 createdEngine = cpuEngine
                 initializedBackend = "CPU"
                 Log.i(TAG, "[VLM] CPU backend initialized successfully for $modelKey")
@@ -253,10 +301,14 @@ class VlmNativeService(private val context: Context) {
         )
     }
 
+    @OptIn(ExperimentalApi::class)
     suspend fun analyzeImage(
         imagePath: String,
         prompt: String,
-        maxTokens: Int = 64
+        maxTokens: Int = 64,
+        structuredOutputFormat: String? = null,
+        externalPreprocessMs: Long = 0,
+        onTextChunk: (suspend (String) -> Unit)? = null
     ): Map<String, Any?> {
         if (!isInferring.compareAndSet(false, true)) {
             Log.w(TAG, "[VLM] Inference already running, request ignored")
@@ -278,11 +330,37 @@ class VlmNativeService(private val context: Context) {
                 )
             }
 
+            val responseSchema = when (structuredOutputFormat) {
+                null -> null
+                "scene" -> STRUCTURED_SCENE_SCHEMA
+                "hazard" -> STRUCTURED_HAZARD_SCHEMA
+                else -> return mapOf(
+                    "success" to false,
+                    "error" to "UNSUPPORTED_RESPONSE_FORMAT",
+                    "message" to "Unsupported structured output format: $structuredOutputFormat"
+                )
+            }
+
             // Create fresh conversation session on warm engine (< 5ms)
-            // This reuses GPU weights while preventing KV-cache token limit overflow
-            val conv = currentEngine.createConversation(ConversationConfig())
+            // maxOutputToken is applied to ConversationConfig in LiteRT-LM 0.16.1
+            val convConfig = ConversationConfig(
+                maxOutputToken = maxTokens,
+                enableResponseFormat = responseSchema != null,
+            )
+            val constrainedDecodingWasEnabled =
+                ExperimentalFlags.enableConversationConstrainedDecoding
+            val conv = try {
+                if (responseSchema != null) {
+                    ExperimentalFlags.enableConversationConstrainedDecoding = true
+                }
+                currentEngine.createConversation(convConfig)
+            } finally {
+                ExperimentalFlags.enableConversationConstrainedDecoding =
+                    constrainedDecodingWasEnabled
+            }
+            activeConversation = conv
             try {
-                Log.i(TAG, "[VLM] Starting inference: model=$loadedModelKey, backend=$activeBackend, prompt='$prompt'")
+                Log.i(TAG, "[VLM] Starting inference: model=$loadedModelKey, backend=$activeBackend, structuredOutput=$structuredOutputFormat, prompt='$prompt', maxTokens=$maxTokens")
                 val startTotal = SystemClock.elapsedRealtime()
 
                 // Preprocess: read image file
@@ -298,7 +376,7 @@ class VlmNativeService(private val context: Context) {
                 }
 
                 val imageBytes = imageFile.readBytes()
-                val preprocessMs = SystemClock.elapsedRealtime() - startPreprocess
+                val preprocessMs = externalPreprocessMs + SystemClock.elapsedRealtime() - startPreprocess
                 Log.i(TAG, "[VLM] Image ready: $preprocessMs ms (size: ${imageBytes.size} bytes)")
 
                 // Build multimodal message: Text prompt + ImageBytes
@@ -307,53 +385,69 @@ class VlmNativeService(private val context: Context) {
                 contentsList.add(Content.ImageBytes(imageBytes))
                 val multimodalInput = Contents.of(contentsList)
 
-                // Measure generation and TTFT via streaming flow or fallback
+                // Measure generation and TTFT via streaming flow or safe fallback
                 val startGeneration = SystemClock.elapsedRealtime()
-                var firstTokenTimeMs: Long? = null
-                var tokenCount = 0
+                var firstTextChunkTimeMs: Long? = null
+                var chunkCount = 0
+                var receivedAnyChunk = false
                 val fullResponseBuilder = StringBuilder()
 
                 try {
-                    // Collect streaming chunks to accurately capture Time To First Token (TTFT)
-                    conv.sendMessageAsync(multimodalInput).collect { msg ->
-                        if (firstTokenTimeMs == null) {
-                            firstTokenTimeMs = SystemClock.elapsedRealtime() - startGeneration
-                            Log.i(TAG, "[VLM] TTFT captured: $firstTokenTimeMs ms")
-                        }
+                    // Collect streaming chunks to accurately capture Time To First Chunk (TTFT)
+                    conv.sendMessageAsync(
+                        multimodalInput,
+                        responseFormat = responseSchema?.let { ResponseFormat.json(it) },
+                    ).collect { msg ->
+                        receivedAnyChunk = true
                         val textChunks = msg.contents.contents
                             .filterIsInstance<Content.Text>()
                             .joinToString("") { it.text }
                         if (textChunks.isNotEmpty()) {
+                            if (firstTextChunkTimeMs == null) {
+                                firstTextChunkTimeMs = SystemClock.elapsedRealtime() - startGeneration
+                                Log.i(TAG, "[VLM] Stream TTFT (first text): $firstTextChunkTimeMs ms")
+                            }
                             fullResponseBuilder.append(textChunks)
-                            tokenCount++
+                            chunkCount++
+                            onTextChunk?.invoke(textChunks)
                         }
                     }
                 } catch (flowErr: Throwable) {
-                    Log.w(TAG, "[VLM] Flow streaming exception: ${flowErr.message}, trying synchronous sendMessage fallback...", flowErr)
-                    val syncResp = conv.sendMessage(multimodalInput)
-                    val text = syncResp.contents.contents
-                        .filterIsInstance<Content.Text>()
-                        .joinToString("\n") { it.text }
-                    fullResponseBuilder.append(text)
+                    if (flowErr is CancellationException) throw flowErr
+                    if (!receivedAnyChunk) {
+                        Log.w(TAG, "[VLM] Streaming threw before any chunks: ${flowErr.message}, falling back to synchronous sendMessage...", flowErr)
+                        val syncResp = conv.sendMessage(multimodalInput)
+                        val text = syncResp.contents.contents
+                            .filterIsInstance<Content.Text>()
+                            .joinToString("\n") { it.text }
+                        fullResponseBuilder.append(text)
+                    } else {
+                        Log.w(TAG, "[VLM] Streaming threw after partial text received (${fullResponseBuilder.length} chars). Retaining partial result to avoid duplicate prompt generation.", flowErr)
+                    }
                 }
 
                 val generationMs = SystemClock.elapsedRealtime() - startGeneration
                 val totalInferenceMs = SystemClock.elapsedRealtime() - startTotal
+                val benchmark = try {
+                    conv.getBenchmarkInfo()
+                } catch (benchmarkError: Throwable) {
+                    Log.w(TAG, "[VLM] LiteRT-LM benchmark metrics unavailable: ${benchmarkError.message}")
+                    null
+                }
 
                 var responseText = fullResponseBuilder.toString().trim()
                 if (responseText.isBlank()) {
                     responseText = "No response generated."
                 }
 
-                // If token count from chunks is 0, estimate from word/subword count
-                val finalTokenCount = if (tokenCount > 0) {
-                    tokenCount
-                } else {
-                    responseText.split(Regex("\\s+")).size
-                }
-
-                val generationSec = if (generationMs > 0) generationMs / 1000.0 else 0.001
-                val tokensPerSecond = finalTokenCount / generationSec
+                val charCount = responseText.length
+                val generatedTokens = benchmark?.lastDecodeTokenCount ?: 0
+                val tokensPerSecond = benchmark?.lastDecodeTokensPerSecond ?: 0.0
+                val decodeMsPerToken = if (tokensPerSecond > 0.0) 1000.0 / tokensPerSecond else null
+                val sdkTtftMs = benchmark?.timeToFirstTokenInSecond?.times(1000.0)
+                // LiteRT-LM's benchmark TTFT can precede delivery of usable text chunks.
+                // Report the app-observable first text chunk as the primary streaming TTFT.
+                val measuredTtftMs = firstTextChunkTimeMs?.toDouble()
 
                 val runtime = Runtime.getRuntime()
                 val javaHeapMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024.0 * 1024.0)
@@ -361,8 +455,10 @@ class VlmNativeService(private val context: Context) {
 
                 Log.i(
                     TAG,
-                    "[VLM] Finished: total=${totalInferenceMs}ms, TTFT=${firstTokenTimeMs ?: 0}ms, " +
-                    "gen=${generationMs}ms, tokens=$finalTokenCount (~${"%.2f".format(tokensPerSecond)} tps)"
+                    "[VLM] mode=english_default, stream_ttft_ms=${measuredTtftMs ?: -1.0}, " +
+                    "sdk_ttft_ms=${sdkTtftMs ?: -1.0}, " +
+                    "decode_ms_per_token=${decodeMsPerToken ?: -1.0}, tokens_per_second=$tokensPerSecond, " +
+                    "tokens=$generatedTokens, total_generation_ms=$generationMs, vision_encode_ms=unavailable"
                 )
 
                 return mapOf(
@@ -372,10 +468,14 @@ class VlmNativeService(private val context: Context) {
                     "modelLoadMs" to 0L, // Warm inference
                     "isWarm" to true,
                     "preprocessMs" to preprocessMs,
-                    "timeToFirstTokenMs" to firstTokenTimeMs,
+                    "timeToFirstTokenMs" to measuredTtftMs,
+                    "sdkTimeToFirstTokenMs" to sdkTtftMs,
+                    "visionEncodeMs" to null,
+                    "decodeMsPerToken" to decodeMsPerToken,
                     "generationMs" to generationMs,
                     "totalInferenceMs" to totalInferenceMs,
-                    "generatedTokens" to finalTokenCount,
+                    "outputChars" to charCount,
+                    "generatedTokens" to generatedTokens,
                     "tokensPerSecond" to tokensPerSecond,
                     "backend" to activeBackend,
                     "requestedBackend" to requestedBackend,
@@ -388,8 +488,17 @@ class VlmNativeService(private val context: Context) {
                 } catch (ce: Throwable) {
                     Log.w(TAG, "[VLM] Note during conv.close(): ${ce.message}")
                 }
+                if (activeConversation === conv) activeConversation = null
             }
         } catch (e: Throwable) {
+            if (e is CancellationException) {
+                if (onTextChunk != null) throw e
+                return mapOf(
+                    "success" to false,
+                    "error" to "CANCELLED",
+                    "message" to "Inference cancelled"
+                )
+            }
             Log.e(TAG, "[VLM] Unexpected error during analyzeImage: ${e.message}", e)
             return mapOf(
                 "success" to false,
@@ -398,6 +507,14 @@ class VlmNativeService(private val context: Context) {
             )
         } finally {
             isInferring.set(false)
+        }
+    }
+
+    fun cancelInference() {
+        try {
+            activeConversation?.cancelProcess()
+        } catch (e: Throwable) {
+            Log.w(TAG, "[VLM] Could not cancel inference: ${e.message}")
         }
     }
 
@@ -464,7 +581,6 @@ class VlmNativeService(private val context: Context) {
 
     suspend fun unloadModel(): Unit = mutex.withLock {
         unloadInternal()
-        System.gc()
-        System.runFinalization()
     }
+
 }

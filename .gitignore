@@ -74,4 +74,14 @@ temp_classes*
 # Downloaded models & cache
 models_download/
 *.litertlm
+training/smolvlm2_vi/.venv/
+training/smolvlm2_vi/outputs/
 
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+*.md

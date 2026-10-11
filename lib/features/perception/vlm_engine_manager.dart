@@ -1,14 +1,10 @@
 import 'package:flutter/foundation.dart';
 import '../vlm/models/vlm_result.dart';
+import '../vlm/models/vlm_stream_event.dart';
 import '../vlm/services/vlm_service.dart';
 import 'gpu_inference_scheduler.dart';
 
-enum EngineStatus {
-  unloaded,
-  loading,
-  ready,
-  error,
-}
+enum EngineStatus { unloaded, loading, ready, error }
 
 class VlmEngineManager {
   static final VlmEngineManager _instance = VlmEngineManager._internal();
@@ -25,9 +21,16 @@ class VlmEngineManager {
   String activeBackend = 'NONE';
   String requestedBackend = 'AUTO';
 
+  Future<bool> isModelAvailable(String modelKey) async =>
+      (await _vlmService.getStatus(modelKey: modelKey)).modelExists;
+
   /// Preloads or checks SmolVLM2 (warm engine)
-  Future<bool> ensureSmolReady({String backend = 'AUTO'}) async {
-    if (smolStatus == EngineStatus.ready && currentlyLoadedModelKey == VlmModelInfo.smolVlm2.key) {
+  Future<bool> ensureSmolReady({
+    String backend = 'AUTO',
+    String modelKey = 'smolvlm2_500m',
+  }) async {
+    if (smolStatus == EngineStatus.ready &&
+        currentlyLoadedModelKey == modelKey) {
       return true;
     }
 
@@ -35,13 +38,13 @@ class VlmEngineManager {
     requestedBackend = backend;
 
     final initRes = await _vlmService.initialize(
-      modelKey: VlmModelInfo.smolVlm2.key,
+      modelKey: modelKey,
       backend: backend,
     );
 
     if (initRes['success'] == true) {
       smolStatus = EngineStatus.ready;
-      currentlyLoadedModelKey = VlmModelInfo.smolVlm2.key;
+      currentlyLoadedModelKey = modelKey;
       activeBackend = initRes['backend']?.toString() ?? backend;
       // Gemma engine is swapped out to protect memory
       gemmaStatus = EngineStatus.unloaded;
@@ -54,7 +57,8 @@ class VlmEngineManager {
 
   /// Lazy-loads Gemma 4 on demand
   Future<bool> ensureGemmaReady({String backend = 'AUTO'}) async {
-    if (gemmaStatus == EngineStatus.ready && currentlyLoadedModelKey == VlmModelInfo.gemma4.key) {
+    if (gemmaStatus == EngineStatus.ready &&
+        currentlyLoadedModelKey == VlmModelInfo.gemma4.key) {
       return true;
     }
 
@@ -86,8 +90,12 @@ class VlmEngineManager {
     required String prompt,
     int maxTokens = 64,
     int targetResolution = 512,
+    String? structuredOutputFormat,
+    String modelKey = 'smolvlm2_500m',
   }) async {
-    await ensureSmolReady(backend: requestedBackend);
+    if (!await ensureSmolReady(backend: requestedBackend, modelKey: modelKey)) {
+      throw StateError('Could not load VLM model: $modelKey');
+    }
 
     return _gpuScheduler.runWithGpuLock(
       priority: GpuPriority.smolOccasional,
@@ -97,8 +105,35 @@ class VlmEngineManager {
           prompt: prompt,
           maxTokens: maxTokens,
           targetResolution: targetResolution,
+          structuredOutputFormat: structuredOutputFormat,
         );
       },
+    );
+  }
+
+  Stream<VlmStreamEvent> streamSmolInference({
+    required String imagePath,
+    required String prompt,
+    int maxTokens = 64,
+    int targetResolution = 512,
+    String? structuredOutputFormat,
+    String modelKey = 'smolvlm2_500m',
+  }) async* {
+    if (!await ensureSmolReady(backend: requestedBackend, modelKey: modelKey)) {
+      throw StateError('Could not load VLM model: $modelKey');
+    }
+
+    yield* _gpuScheduler.runStreamWithGpuLock(
+      priority: GpuPriority.smolOccasional,
+      action: () => _vlmService.generateStream(
+        VlmRequest(
+          imagePath: imagePath,
+          prompt: prompt,
+          maxTokens: maxTokens,
+          targetResolution: targetResolution,
+          structuredOutputFormat: structuredOutputFormat,
+        ),
+      ),
     );
   }
 
@@ -124,15 +159,21 @@ class VlmEngineManager {
     );
   }
 
-  /// Memory pressure handler: unloads Gemma first to preserve YOLO + Smol
+  /// Memory pressure handler: release whichever VLM is resident.
   Future<void> handleMemoryPressure() async {
-    debugPrint('[VlmEngineManager] Memory pressure detected: Unloading Gemma...');
-    if (currentlyLoadedModelKey == VlmModelInfo.gemma4.key) {
-      await _vlmService.dispose();
-      gemmaStatus = EngineStatus.unloaded;
-      currentlyLoadedModelKey = null;
-      activeBackend = 'NONE';
+    if (currentlyLoadedModelKey == null &&
+        smolStatus != EngineStatus.ready &&
+        gemmaStatus != EngineStatus.ready) {
+      return;
     }
+
+    debugPrint('[VlmEngineManager] Memory pressure detected; releasing VLM');
+    await _vlmService.cancel();
+    await _vlmService.dispose();
+    smolStatus = EngineStatus.unloaded;
+    gemmaStatus = EngineStatus.unloaded;
+    currentlyLoadedModelKey = null;
+    activeBackend = 'NONE';
   }
 
   /// Disposes active engines

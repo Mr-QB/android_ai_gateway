@@ -3,6 +3,8 @@ import '../../../camera/data/coco_labels.dart';
 import '../../utils/json_extractor.dart';
 import '../../utils/performance_logger.dart';
 import '../../output/assistive_output_manager.dart';
+import '../../../assistant/visual_observation.dart';
+import '../../../assistant/vietnamese_response_builder.dart';
 import '../../../sense_graph/sense_graph_manager.dart';
 import '../base_agent.dart';
 
@@ -13,6 +15,7 @@ class HazardAgentResult {
   final String reason;
   final String message;
   final bool isImmediateRuleWarning;
+  final bool analysisSucceeded;
   final String rawResponse;
   final double latencyMs;
 
@@ -23,6 +26,7 @@ class HazardAgentResult {
     required this.reason,
     required this.message,
     required this.isImmediateRuleWarning,
+    required this.analysisSucceeded,
     required this.rawResponse,
     required this.latencyMs,
   });
@@ -30,6 +34,30 @@ class HazardAgentResult {
 
 class HazardAgent extends BasePerceptionAgent {
   HazardAgent({required super.engineManager}) : super(name: 'HazardAgent');
+
+  static const _requiredStructuredFields = {
+    'OBJECT',
+    'ACTION',
+    'DIRECTION',
+    'DISTANCE',
+    'RISK',
+    'TEXT',
+  };
+
+  static bool isValidVlmAssessment({
+    required bool inferenceSucceeded,
+    required Map<String, dynamic> response,
+  }) =>
+      inferenceSucceeded &&
+      response['hazard'] is bool &&
+      _requiredStructuredFields.every((key) => response[key] is String);
+
+  static bool assessmentReportsHazard(Map<String, dynamic> response) =>
+      response['hazard'] == true ||
+      const {
+        'high',
+        'medium',
+      }.contains(response['RISK']?.toString().toLowerCase());
 
   /// Critical obstacle classes in COCO that pose immediate hazard if close
   static const Set<String> _criticalClasses = {
@@ -45,8 +73,13 @@ class HazardAgent extends BasePerceptionAgent {
 
   /// Deterministic rule-based pre-check before calling VLM:
   /// Detects whether any object occupies a dangerous area in the center/forward path with high area
-  static ({bool hasImmediateHazard, String warningMessage, String direction, double severity}) checkDeterministicSafety(
-      List<Detection> detections) {
+  static ({
+    bool hasImmediateHazard,
+    String warningMessage,
+    String direction,
+    double severity,
+  })
+  checkDeterministicSafety(List<Detection> detections) {
     for (final det in detections) {
       final className = (det.classId >= 0 && det.classId < cocoLabels.length)
           ? cocoLabels[det.classId]
@@ -65,7 +98,9 @@ class HazardAgent extends BasePerceptionAgent {
         direction = 'phía trước';
       }
 
-      if (_criticalClasses.contains(className) && area > 0.20 && det.confidence > 0.60) {
+      if (_criticalClasses.contains(className) &&
+          area > 0.20 &&
+          det.confidence > 0.60) {
         return (
           hasImmediateHazard: true,
           warningMessage: 'Cảnh báo! Có $className lớn ngay $direction.',
@@ -113,41 +148,72 @@ class HazardAgent extends BasePerceptionAgent {
         ? 'Detections in view: ${detections.map((d) => (d.classId < cocoLabels.length ? cocoLabels[d.classId] : d.classId)).join(", ")}'
         : '';
 
-    final prompt = '''
+    final prompt =
+        '''
 Safety check for a visually impaired pedestrian:
 $detectionSummary
-Look for steps, drop-offs, obstacles blocking path, low-hanging items, or moving vehicles.
-Respond strictly in JSON:
-{
-  "hazard": true,
-  "severity": 0.85,
-  "direction": "center",
-  "reason": "short explanation in English",
-  "message": "Cảnh báo ngắn gọn bằng tiếng Việt"
-}
+Look for steps, drop-offs, obstacles blocking the path, low-hanging items, or moving vehicles.
+Return only compact JSON with hazard (boolean), OBJECT, ACTION, DIRECTION, DISTANCE, RISK, and TEXT fields. Use short canonical labels and no prose. TEXT is exact visible text or "none".
 ''';
-
     final vlmResult = await engineManager.runSmolInference(
       imagePath: imagePath,
       prompt: prompt,
       maxTokens: 96,
+      structuredOutputFormat: 'hazard',
     );
-    final latency = (DateTime.now().millisecondsSinceEpoch - startTime).toDouble();
+    final latency = (DateTime.now().millisecondsSinceEpoch - startTime)
+        .toDouble();
 
     final jsonMap = JsonExtractor.extractJsonMap(vlmResult.text);
 
-    final hazard = (jsonMap['hazard'] == true) || ruleCheck.hasImmediateHazard;
-    final severity = (jsonMap['severity'] as num?)?.toDouble() ?? ruleCheck.severity;
-    final direction = jsonMap['direction']?.toString() ?? ruleCheck.direction;
-    final reason = jsonMap['reason']?.toString() ?? 'Obstacle detected in pathway';
-    final message = jsonMap['message']?.toString() ??
-        (ruleCheck.hasImmediateHazard ? ruleCheck.warningMessage : 'Đường đi thông thoáng.');
-
+    VisualObservation? observation;
+    try {
+      observation = StructuredVlmParser.parse(vlmResult.text);
+    } on FormatException {
+      // Preserve the deterministic rule warning and report an inconclusive check.
+    }
+    final safetyObservation = observation == null
+        ? null
+        : VisualObservation(
+            object: observation.object,
+            action: observation.action,
+            direction: observation.direction,
+            distance: observation.distance,
+            risk: observation.risk,
+          );
+    final analysisSucceeded = isValidVlmAssessment(
+      inferenceSucceeded: vlmResult.success,
+      response: jsonMap,
+    );
+    final risk = safetyObservation?.risk?.toLowerCase();
+    final hazard =
+        (analysisSucceeded && assessmentReportsHazard(jsonMap)) ||
+        ruleCheck.hasImmediateHazard;
+    final severity = switch (risk) {
+      'high' => 0.95,
+      'medium' => 0.65,
+      'low' => 0.25,
+      _ => ruleCheck.severity,
+    };
+    final direction = safetyObservation?.direction ?? ruleCheck.direction;
+    final reason = analysisSucceeded
+        ? safetyObservation?.object ?? 'Visual hazard analysis completed'
+        : vlmResult.message ?? 'VLM hazard analysis failed';
+    final message = ruleCheck.hasImmediateHazard
+        ? ruleCheck.warningMessage
+        : !analysisSucceeded
+        ? ''
+        : hazard
+        ? VietnameseResponseBuilder.build(safetyObservation!) ??
+              'C\u1ea3nh b\u00e1o, c\u00f3 th\u1ec3 c\u00f3 v\u1eadt c\u1ea3n ph\u00eda tr\u01b0\u1edbc.'
+        : '\u0110\u01b0\u1eddng \u0111i th\u00f4ng tho\u00e1ng.';
     if (hazard && !ruleCheck.hasImmediateHazard && message.isNotEmpty) {
       // If VLM found a hazard that rule check missed, dispatch high warning
       AssistiveOutputManager().dispatch(
         message: message,
-        priority: AlertPriority.highWarning,
+        priority: risk == 'high'
+            ? AlertPriority.criticalHazard
+            : AlertPriority.highWarning,
         sourceAgent: name,
       );
 
@@ -178,6 +244,7 @@ Respond strictly in JSON:
       reason: reason,
       message: message,
       isImmediateRuleWarning: ruleCheck.hasImmediateHazard,
+      analysisSucceeded: analysisSucceeded,
       rawResponse: vlmResult.text,
       latencyMs: latency,
     );
