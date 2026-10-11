@@ -1,0 +1,19 @@
+{
+  "vision_encoder": "frozen",
+  "vision_projection": "frozen",
+  "language_backbone": "frozen",
+  "lora_targets": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj"
+  ],
+  "max_answer_words": 30,
+  "rank": 8,
+  "alpha": 16,
+  "dropout": 0.05,
+  "learning_rate": 0.0001,
+  "gradient_accumulation_steps": 8,
+  "epochs": 1,
+  "base_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+}

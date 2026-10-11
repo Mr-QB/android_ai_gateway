@@ -14,6 +14,29 @@
 * **Kiến trúc Native C++ Bridge**: Sử dụng Dart FFI giao tiếp trực tiếp với `libnative_ai_engine.so`.
 * 📖 **Tài liệu chi tiết cơ chế gọi & phân tích FPS**: Xem [docs/YOLO_PIPELINE_AND_PERFORMANCE.md](docs/YOLO_PIPELINE_AND_PERFORMANCE.md).
 
+---
+
+## 📍 Native ORB-SLAM3 Dataset Replay
+
+Supported:
+- EuRoC `cam0` monocular
+- EuRoC `cam0` + `imu0` mono-inertial
+- Realtime replay (0.5x, 1.0x, 2.0x)
+- Maximum-speed replay
+
+Native library:
+`liborbslam_native.so` (Android ARM64 / `arm64-v8a`)
+
+Dataset is not bundled in APK.
+
+See:
+- [docs/ORB_SLAM_SETUP.md](docs/ORB_SLAM_SETUP.md)
+- [docs/ORB_SLAM_COORDINATES.md](docs/ORB_SLAM_COORDINATES.md)
+- [docs/ORB_SLAM_BENCHMARK.md](docs/ORB_SLAM_BENCHMARK.md)
+
+### License Notice
+ORB-SLAM3 is released under the GNU General Public License v3.0 (GPLv3). Its inclusion and build within `liborbslam_native.so` is governed by the GPLv3 license terms. This is a technical integration note and not a commercial license opinion.
+
 
 ---
 
@@ -36,10 +59,10 @@
 
 1. **Persistent Warm Engine Holder (Singleton)**:
    - Model chỉ nạp vào RAM/VRAM **đúng 1 lần duy nhất** (Cold Start).
-   - Từ lần chạy thứ 2 trở đi (**Warm Inference**), trọng số mô hình, OpenCL GPU shaders, tokenizer và bộ nhớ đệm được **tái sử dụng 100%**, thời gian **Model Load = 0 ms**.
-   - Mỗi câu hỏi/ảnh mới chỉ khởi tạo `Conversation(ConversationConfig())` siêu nhẹ (< 5 ms) trên warm engine có sẵn, giúp dọn sạch KV-cache của ảnh trước và tránh tràn giới hạn context token (`Task failed with state: 7`).
+   - Engine và trọng số giữ resident giữa các request trên cùng process; request mới tạo `Conversation` riêng. KV cache thuộc conversation và không được tái sử dụng giữa các ảnh.
+   - Khi model đã resident, request warm không nạp lại trọng số; không đồng nghĩa tổng thời gian khởi tạo request bằng 0 ms.
 
-2. **Cơ chế Chuyển đổi Model An toàn (Xiaomi 12T - RAM 8GB)**:
+2. **Cơ chế Chuyển đổi Model An toàn**:
    - Để tránh quá tải bộ nhớ khi nạp đồng thời cả 2 model, app chỉ giữ **1 model resident** tại một thời điểm.
    - Khi chuyển từ `SmolVLM2` $\rightarrow$ `Gemma-4` (hoặc ngược lại):
      ```
@@ -61,7 +84,7 @@
 
 ---
 
-## 📥 Hướng dẫn Tải & Nạp Model vào Xiaomi 12T bằng ADB
+## 📥 Hướng dẫn Tải & Nạp Model vào thiết bị Android bằng ADB
 
 Thư mục lưu trữ nội bộ của app:
 ```text
@@ -92,18 +115,96 @@ adb shell run-as com.example.android_ai_gateway cp /data/local/tmp/gemma-4-E2B-i
 
 ---
 
-## 📊 Kết quả Benchmark Tham khảo (Xiaomi 12T - MediaTek Dimensity 8100-Ultra / GPU Mali-G610 MC6)
+## 📊 Benchmark trên thiết bị
 
-### SmolVLM2-500M (OpenCL GPU Delegate)
-* **Cold Start Load**: ~6,800 ms (biên dịch OpenCL kernels vào Mali-G610 VRAM).
-* **Warm Model Load**: **0 ms** (Engine resident).
-* **TTFT (Time To First Token)**: ~350 - 550 ms.
-* **Tốc độ sinh (Decode Speed)**: ~14 - 18 tokens/giây.
-* **Bộ nhớ RAM sử dụng**: Native Heap ~800 MB, Java Heap ~18 MB.
+Số liệu kiểm chứng hiện có lấy trên Xiaomi 12S Pro, Android 15, GPU Mali-G610;
+đây là số đo toàn process khi camera/YOLO và SmolVLM2 cùng chạy, không phải bộ
+nhớ riêng của model. Benchmark 5 lượt warm ghi nhận TTFT trung bình 365.8 ms,
+8.19 tokens/s, native heap 254,604 KiB, PSS 975,462 KiB và graphics 300,664 KiB.
+Khởi tạo GPU model mất 11,732 ms trong lần đo ban đầu. Một lượt khác sau tích hợp
+structured output có 1,320.8 ms TTFT và 2.75 tokens/s, đồng thời đầu ra bị parser
+từ chối; không dùng lượt này thay cho benchmark warm. Gemma-4 chưa có số đo được
+xác minh trên thiết bị hiện tại. Xem [benchmark chi tiết](docs/vietnamese_vlm/benchmark.md)
+để biết giới hạn so sánh và số đo cập nhật.
 
-### Gemma-4-E2B-it (GPU Bundle)
-* **Cold Start Load**: ~12,000 - 16,000 ms.
-* **Warm Model Load**: **0 ms** (Engine resident).
-* **TTFT**: ~1,200 - 1,800 ms.
-* **Tốc độ sinh (Decode Speed)**: ~6 - 9 tokens/giây.
-* **Bộ nhớ RAM sử dụng**: Native Heap ~3.2 GB, Java Heap ~24 MB.
+---
+
+## 🏗️ Realtime AI Pipeline Architecture (Refactored)
+
+### 1. Tổng quan Kiến trúc Realtime
+```text
+                    ┌─────────────────┐
+                    │ Android Camera  │
+                    │ startImageStream│
+                    └────────┬────────┘
+                             │
+                             ▼ (YUV420_888 / NV21 packed)
+                    ┌─────────────────┐
+                    │   CameraFrame   │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │    FrameHub     │
+                    │ latest frame    │
+                    │ queue size = 1  │
+                    └──────┬─────┬────┘
+                           │     │
+                  realtime │     │ snapshot/event
+                           │     │
+                           ▼     ▼
+                     ┌────────┐  ┌───────────────┐
+                     │ YOLO   │  │ VLM Snapshot  │
+                     │ NCNN   │  │ SmolVLM/Gemma │
+                     └───┬────┘  └──────┬────────┘
+                         │              │
+                         ▼              ▼
+                    Detection      Description/OCR
+                         │              │
+                         └──────┬───────┘
+                                ▼
+                       Flutter UI / Agent
+```
+
+### 2. Camera Realtime & Elimination of JPEG Pipeline
+- **Loại bỏ hoàn toàn snapshot JPEG**: Trước đây luồng detection sử dụng `takePicture()` $\rightarrow$ nén JPEG $\rightarrow$ `readAsBytes()` $\rightarrow$ decode bitmap bằng `package:image` tốn từ 1,000ms đến 1,800ms trên mỗi frame trong Dart runtime.
+- **Sử dụng `startImageStream`**: Camera stream liên tục phát ra `CameraImage` ở định dạng YUV420_888. Hàm `packCameraImageToNv21()` gom plane Y và UV thành mảng NV21 tuyến tính trong < 1.5ms, không decode sang bitmap hay RGB trong Dart.
+- **Native Color Conversion & Rotation**: Mảng NV21 được truyền qua FFI sang C++ NCNN (`detect_yuv420_sp`). NCNN thực hiện xoay (`ncnn::kanna_rotate_yuv420sp`) và chuyển đổi màu YUV sang RGB (`ncnn::yuv420sp2rgb`) bằng tập lệnh ARM NEON tối ưu phần cứng trong < 2ms.
+
+### 3. Frame Dropping Policy (Queue size <= 1)
+- `FrameHub` và `Yolo26FrameWorker` (C++) áp dụng cơ chế Latest-Frame Drop:
+  - Bounded queue dung lượng tối đa 1 frame.
+  - Khi camera phát sinh 30 FPS nhưng worker NCNN xử lý 20-25 FPS, frame mới nhất sẽ tự động thay thế frame cũ đang chờ, các frame dư thừa bị drop ngay lập tức.
+  - Loại bỏ hoàn toàn backlog và độ trễ tích lũy (latency không bao giờ bị tăng dần theo thời gian).
+
+### 4. Bounded Buffer Reuse & Zero UI Blocking
+- **Worker Thread Dedicated**: Worker C++ chạy trên `std::thread` riêng với `std::condition_variable` và `std::mutex`, đảm bảo suy luận NCNN không block Flutter UI thread (60/120Hz mượt mà).
+- **Persistent Workspace Buffers**: Các buffer FFI và C++ (`FrameWorkspace`, `yuv_buffer`, persistent detection structs) được khởi tạo một lần và tái sử dụng qua các frame, triệt tiêu overhead `calloc/malloc/free` mỗi frame.
+
+### 5. CPU / Vulkan Backend & Thread Configuration
+- Cung cấp 3 chế độ suy luận linh hoạt qua giao diện:
+  - **AUTO**: Tự động nhận diện GPU Vulkan; ưu tiên Vulkan GPU Compute nếu khả dụng, fallback về CPU nếu GPU không hỗ trợ.
+  - **VULKAN**: Ép buộc suy luận trên GPU Vulkan (tối ưu cho các thiết bị Mali-G610 đã kiểm tra).
+  - **CPU**: Suy luận trên các nhân ARM Cortex big cores (`ncnn::get_big_cpu_count()`).
+- Cho phép cấu hình số luồng CPU linh hoạt: **AUTO**, **2 threads**, **3 threads**, **4 threads**.
+
+### 6. Coordinate Mapping & Zero-Copy Overlay
+- Flutter không vẽ lại ảnh hay nén lại frame để hiển thị bounding box.
+- Preview camera hiển thị trực tiếp từ Surface native qua `CameraPreview`.
+- Bounding box được vẽ qua `CustomPaint` (`DetectionOverlay`). Lớp `ModelCoordinateMapper` chịu trách nhiệm unletterbox (hoàn tác padding và tỉ lệ scale 640x640) và ánh xạ chính xác tọa độ camera sang tọa độ preview màn hình (tính toán góc xoay sensor, `BoxFit.cover`, và mirror cho camera trước).
+
+### 7. VLM Pipeline & Lifecycle Management
+- **Warm Engine Retention**: `VlmNativeService` giữ engine LiteRT-LM nạp thường trực trong bộ nhớ; mỗi yêu cầu người dùng chỉ tạo mới một `Conversation` nhẹ và đóng ngay sau khi hoàn thành.
+- **Áp dụng chính xác `maxTokens`**: Sử dụng `ConversationConfig(maxOutputToken = maxTokens)` của Google LiteRT-LM SDK v0.16.1.
+- **Safe Streaming Fallback**: Nếu streaming gặp lỗi sau khi đã gửi chunk đầu tiên, app trả về phản hồi từng phần kèm trạng thái lỗi, tuyệt đối không gửi lại toàn bộ prompt để tránh trùng lặp văn bản.
+- **Chỉ số đo đạc trung thực**: Thay thế TPS giả (đếm callback) bằng `TTFT` (Time To First Token), thời gian sinh (generation time), `chars/s`, và `words/s`.
+- **Hủy dọn Coroutine chuẩn xác**: Quản lý bằng `SupervisorJob()` và hủy toàn bộ tác vụ nền trong `onDestroy()` của `MainActivity`.
+
+### 8. Hướng dẫn Benchmarking
+- Mở màn hình Camera: HUD phía trên hiển thị realtime:
+  - Camera FPS và YOLO Processed FPS thực tế.
+  - Drop rate (%) của pipeline.
+  - Độ trễ chi tiết: Preprocess ms, Inference ms, Postprocess ms, Total Native ms.
+  - Chuyển đổi trực tiếp Backend (AUTO / VULKAN / CPU) và Threads (AUTO / 2 / 3 / 4) từ Dropdown Menu để đối sánh hiệu năng tức thì.
+- Tab VLM Benchmark:
+  - Bấm **[BENCH x5]** để so sánh TTFT, tốc độ sinh (chars/s, words/s) và tiêu thụ RAM giữa các lượt Cold Start và Warm Inference.
